@@ -1,0 +1,3 @@
+[submodule "third_party/OpenResearcher"]
+	path = third_party/OpenResearcher
+	url = git@github.com:BaohaoLiao/OpenResearcher.git
