@@ -7,6 +7,7 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OPENRESEARCHER_DIR="${REPO_ROOT}/third_party/OpenResearcher"
 EVAL_ENV_DIR="${REPO_ROOT}/.eval"
 PYTHON_BIN="${EVAL_ENV_DIR}/bin/python"
+RESULTS_ROOT="${RESULTS_ROOT:-/data/agenthle/baohao/agentic_opd/openresearcher_results}"
 
 SEARCH_URL="${SEARCH_URL:-http://localhost:8000}"
 VLLM_SERVER_URL="${VLLM_SERVER_URL:-http://localhost:8001/v1}"
@@ -14,7 +15,7 @@ MODEL_PATH="${MODEL_PATH:-/data/agenthle/baohao/LLMs/OpenResearcher/OpenResearch
 FULL_DATA_GLOB="${FULL_DATA_GLOB:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus/data/*.parquet}"
 SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus-smoke/data}"
 SMOKE_DATA_PATH="${SMOKE_DATA_PATH:-${SMOKE_DATA_DIR}/smoke.parquet}"
-OUTPUT_DIR="${OUTPUT_DIR:-${OPENRESEARCHER_DIR}/results/browsecomp_plus/smoke_test}"
+OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/smoke_test}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
 
 usage() {
@@ -33,6 +34,7 @@ Required running services:
 Configurable environment variables:
   SEARCH_URL        Search service URL (default: ${SEARCH_URL})
   VLLM_SERVER_URL   vLLM API URL (default: ${VLLM_SERVER_URL})
+    RESULTS_ROOT      Root directory for evaluation outputs (default: ${RESULTS_ROOT})
   MODEL_PATH        Local OpenResearcher model path (default: ${MODEL_PATH})
   FULL_DATA_GLOB    Full BrowseComp Plus parquet glob
   SMOKE_DATA_PATH   Output parquet for the one-example smoke dataset

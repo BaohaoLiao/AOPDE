@@ -143,6 +143,7 @@ The helper scripts in `eval_scripts` default to these local model paths:
 
 - dense retriever: `/data/agenthle/baohao/LLMs/Qwen/Qwen3-Embedding-8B`
 - generator model: `/data/agenthle/baohao/LLMs/OpenResearcher/OpenResearcher-30B-A3B`
+- result root: `/data/agenthle/baohao/agentic_opd/openresearcher_results`
 
 These defaults can be overridden through environment variables when needed.
 
@@ -185,7 +186,7 @@ If you want to force a fresh smoke test run and avoid reusing an old output dire
 
 ```bash
 source .eval/bin/activate
-OUTPUT_DIR=/workspace/baohao/AOPDE/third_party/OpenResearcher/results/browsecomp_plus/smoke_test_$(date +%Y%m%d_%H%M%S) ./eval_scripts/run_browsecomp_plus_smoke_test.sh
+OUTPUT_DIR=/data/agenthle/baohao/agentic_opd/openresearcher_results/browsecomp_plus/smoke_test_$(date +%Y%m%d_%H%M%S) ./eval_scripts/run_browsecomp_plus_smoke_test.sh
 ```
 
 Common overrides:
@@ -220,11 +221,19 @@ Terminal 3:
 
 ```bash
 source .eval/bin/activate
-cd third_party/OpenResearcher
-bash run_agent.sh results/browsecomp_plus/OpenResearcher_dense 8001 1 browsecomp_plus local /data/agenthle/baohao/LLMs/OpenResearcher/OpenResearcher-30B-A3B
+./eval_scripts/run_browsecomp_plus_full.sh
 ```
 
-If you are serving more than one vLLM endpoint, adjust the base port and server count in `run_agent.sh` accordingly.
+By default this writes to:
+
+- `/data/agenthle/baohao/agentic_opd/openresearcher_results/browsecomp_plus/OpenResearcher_dense_7x1`
+
+To create a fresh timestamped output directory:
+
+```bash
+source .eval/bin/activate
+OUTPUT_DIR=/data/agenthle/baohao/agentic_opd/openresearcher_results/browsecomp_plus/run_$(date +%Y%m%d_%H%M%S) ./eval_scripts/run_browsecomp_plus_full.sh
+```
 
 ## Result Evaluation
 
@@ -232,8 +241,7 @@ After a run completes, evaluate the outputs with:
 
 ```bash
 source .eval/bin/activate
-cd third_party/OpenResearcher
-python eval.py --input_dir results/browsecomp_plus/OpenResearcher_dense
+/workspace/baohao/AOPDE/.eval/bin/python third_party/OpenResearcher/eval.py --input_dir /data/agenthle/baohao/agentic_opd/openresearcher_results/browsecomp_plus/OpenResearcher_dense_7x1
 ```
 
 Replace the input directory with your actual run directory when needed.

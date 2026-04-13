@@ -7,13 +7,14 @@ REPO_ROOT="$(dirname "$SCRIPT_DIR")"
 OPENRESEARCHER_DIR="${REPO_ROOT}/third_party/OpenResearcher"
 EVAL_ENV_DIR="${REPO_ROOT}/.eval"
 PYTHON_BIN="${EVAL_ENV_DIR}/bin/python"
+RESULTS_ROOT="${RESULTS_ROOT:-/data/agenthle/baohao/agentic_opd/openresearcher_results}"
 
 SEARCH_URL="${SEARCH_URL:-http://localhost:8000}"
 MODEL_BASE_PORT="${MODEL_BASE_PORT:-8001}"
 NUM_SERVERS="${NUM_SERVERS:-7}"
 MODEL_PATH="${MODEL_PATH:-/data/agenthle/baohao/LLMs/OpenResearcher/OpenResearcher-30B-A3B}"
 DATA_PATH="${DATA_PATH:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus/data/*.parquet}"
-OUTPUT_DIR="${OUTPUT_DIR:-${OPENRESEARCHER_DIR}/results/browsecomp_plus/OpenResearcher_dense_7x1}"
+OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/OpenResearcher_dense_7x1}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
 BROWSER_BACKEND="${BROWSER_BACKEND:-local}"
 CHECK_SERVICES="${CHECK_SERVICES:-1}"
@@ -36,6 +37,7 @@ Configurable environment variables:
   SEARCH_URL        Search service URL (default: ${SEARCH_URL})
   MODEL_BASE_PORT   First vLLM port (default: ${MODEL_BASE_PORT})
   NUM_SERVERS       Number of deployed vLLM replicas (default: ${NUM_SERVERS})
+    RESULTS_ROOT      Root directory for evaluation outputs (default: ${RESULTS_ROOT})
   MODEL_PATH        Local OpenResearcher model path (default: ${MODEL_PATH})
   DATA_PATH         BrowseComp Plus parquet glob
   OUTPUT_DIR        Output directory for result shards
@@ -45,7 +47,7 @@ Configurable environment variables:
 
 Examples:
   $(basename "$0")
-  OUTPUT_DIR=${OPENRESEARCHER_DIR}/results/browsecomp_plus/run_$(date +%Y%m%d_%H%M%S) $(basename "$0")
+    OUTPUT_DIR=${RESULTS_ROOT}/browsecomp_plus/run_$(date +%Y%m%d_%H%M%S) $(basename "$0")
   MODEL_BASE_PORT=8101 NUM_SERVERS=7 $(basename "$0")
 EOF
 }
