@@ -18,6 +18,9 @@ OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/OpenResearcher_dense_7
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
 BROWSER_BACKEND="${BROWSER_BACKEND:-local}"
 CHECK_SERVICES="${CHECK_SERVICES:-1}"
+SHOW_AGENT_LOGS="${SHOW_AGENT_LOGS:-0}"
+MONITOR_INTERVAL_S="${MONITOR_INTERVAL_S:-15}"
+RUN_LOG="${RUN_LOG:-${OUTPUT_DIR}/run.log}"
 
 usage() {
     cat <<EOF
@@ -44,6 +47,9 @@ Configurable environment variables:
   MAX_CONCURRENCY   Max concurrency per worker (default: ${MAX_CONCURRENCY})
   BROWSER_BACKEND   Browser backend (default: ${BROWSER_BACKEND})
   CHECK_SERVICES    1 to verify endpoints before running, 0 to skip
+    SHOW_AGENT_LOGS   1 to stream deploy_agent logs to terminal, 0 to write them to RUN_LOG only
+    MONITOR_INTERVAL_S  Seconds between progress updates (default: ${MONITOR_INTERVAL_S})
+    RUN_LOG           Log file for deploy_agent output (default: ${RUN_LOG})
 
 Examples:
   $(basename "$0")
@@ -55,6 +61,16 @@ EOF
 fail() {
     echo "Error: $*" >&2
     exit 1
+}
+
+cleanup() {
+    if [[ -n "${monitor_pid:-}" ]] && kill -0 "$monitor_pid" 2>/dev/null; then
+        kill "$monitor_pid" 2>/dev/null || true
+    fi
+
+    if [[ -n "${agent_pid:-}" ]] && kill -0 "$agent_pid" 2>/dev/null; then
+        kill "$agent_pid" 2>/dev/null || true
+    fi
 }
 
 require_dir() {
@@ -111,8 +127,60 @@ print("service_checks_ok")
 PY
 }
 
+resolve_total_tasks() {
+    DATA_PATH="$DATA_PATH" "$PYTHON_BIN" - <<'PY'
+import os
+import duckdb
+
+pattern = os.environ["DATA_PATH"]
+count = duckdb.sql(f"SELECT COUNT(*) FROM read_parquet('{pattern}')").fetchone()[0]
+print(count)
+PY
+}
+
+progress_snapshot() {
+    OUTPUT_DIR="$OUTPUT_DIR" "$PYTHON_BIN" - <<'PY'
+import glob
+import json
+import os
+
+output_dir = os.environ["OUTPUT_DIR"]
+records = {}
+
+for shard_file in glob.glob(os.path.join(output_dir, "node_*_shard_*.jsonl")):
+    with open(shard_file, "r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                record = json.loads(line)
+            except Exception:
+                continue
+            qid = record.get("qid")
+            if qid is None:
+                continue
+            records[qid] = record.get("status")
+
+completed = len(records)
+success = sum(1 for status in records.values() if status == "success")
+failed = sum(1 for status in records.values() if status == "fail")
+print(f"{completed} {success} {failed}")
+PY
+}
+
+monitor_progress() {
+    local total_tasks="$1"
+    local completed success failed remaining
+
+    while kill -0 "$agent_pid" 2>/dev/null; do
+        read -r completed success failed < <(progress_snapshot)
+        remaining=$((total_tasks - completed))
+        printf '[progress] completed %s/%s | success %s | fail %s | remaining %s\n' \
+            "$completed" "$total_tasks" "$success" "$failed" "$remaining"
+        sleep "$MONITOR_INTERVAL_S"
+    done
+}
+
 main() {
-    local server_urls
+    local server_urls total_tasks completed success failed remaining
 
     if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
         usage
@@ -140,6 +208,11 @@ main() {
     fi
 
     mkdir -p "$OUTPUT_DIR"
+    total_tasks="$(resolve_total_tasks)"
+
+    if ! [[ "$MONITOR_INTERVAL_S" =~ ^[1-9][0-9]*$ ]]; then
+        fail "MONITOR_INTERVAL_S must be a positive integer"
+    fi
 
     echo "Running full BrowseComp Plus evaluation"
     echo "  Search service: ${SEARCH_URL}"
@@ -147,18 +220,53 @@ main() {
     echo "  Output dir: ${OUTPUT_DIR}"
     echo "  Model path: ${MODEL_PATH}"
     echo "  Data path: ${DATA_PATH}"
+    echo "  Total tasks: ${total_tasks}"
+    echo "  Log file: ${RUN_LOG}"
 
     cd "$OPENRESEARCHER_DIR"
-    exec "$PYTHON_BIN" deploy_agent.py \
-        --output_dir "$OUTPUT_DIR" \
-        --model_name_or_path "$MODEL_PATH" \
-        --search_url "$SEARCH_URL" \
-        --dataset_name browsecomp_plus \
-        --data_path "$DATA_PATH" \
-        --browser_backend "$BROWSER_BACKEND" \
-        --reasoning_effort high \
-        --vllm_server_url "$server_urls" \
-        --max_concurrency_per_worker "$MAX_CONCURRENCY"
+    trap cleanup EXIT INT TERM
+
+    if [[ "$SHOW_AGENT_LOGS" == "1" ]]; then
+        "$PYTHON_BIN" deploy_agent.py \
+            --output_dir "$OUTPUT_DIR" \
+            --model_name_or_path "$MODEL_PATH" \
+            --search_url "$SEARCH_URL" \
+            --dataset_name browsecomp_plus \
+            --data_path "$DATA_PATH" \
+            --browser_backend "$BROWSER_BACKEND" \
+            --reasoning_effort high \
+            --vllm_server_url "$server_urls" \
+            --max_concurrency_per_worker "$MAX_CONCURRENCY" \
+            2>&1 | tee -a "$RUN_LOG" &
+    else
+        "$PYTHON_BIN" deploy_agent.py \
+            --output_dir "$OUTPUT_DIR" \
+            --model_name_or_path "$MODEL_PATH" \
+            --search_url "$SEARCH_URL" \
+            --dataset_name browsecomp_plus \
+            --data_path "$DATA_PATH" \
+            --browser_backend "$BROWSER_BACKEND" \
+            --reasoning_effort high \
+            --vllm_server_url "$server_urls" \
+            --max_concurrency_per_worker "$MAX_CONCURRENCY" \
+            > "$RUN_LOG" 2>&1 &
+    fi
+
+    agent_pid=$!
+    monitor_progress "$total_tasks" &
+    monitor_pid=$!
+
+    wait "$agent_pid"
+
+    if kill -0 "$monitor_pid" 2>/dev/null; then
+        kill "$monitor_pid" 2>/dev/null || true
+    fi
+
+    read -r completed success failed < <(progress_snapshot)
+    remaining=$((total_tasks - completed))
+    printf '[progress] completed %s/%s | success %s | fail %s | remaining %s\n' \
+        "$completed" "$total_tasks" "$success" "$failed" "$remaining"
+    echo "Evaluation finished. Logs: ${RUN_LOG}"
 }
 
 main "$@"
