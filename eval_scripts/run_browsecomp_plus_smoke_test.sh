@@ -17,6 +17,7 @@ SMOKE_DATA_DIR="${SMOKE_DATA_DIR:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus
 SMOKE_DATA_PATH="${SMOKE_DATA_PATH:-${SMOKE_DATA_DIR}/smoke.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/smoke_test}"
 MAX_CONCURRENCY="${MAX_CONCURRENCY:-1}"
+MAX_ROUNDS="${MAX_ROUNDS:-200}"
 
 usage() {
     cat <<EOF
@@ -40,6 +41,7 @@ Configurable environment variables:
   SMOKE_DATA_PATH   Output parquet for the one-example smoke dataset
   OUTPUT_DIR        Output directory for smoke test results
   MAX_CONCURRENCY   Max concurrency per worker (default: ${MAX_CONCURRENCY})
+  MAX_ROUNDS        Max agent rounds per task (default: ${MAX_ROUNDS})
 EOF
 }
 
@@ -109,6 +111,7 @@ main() {
         --browser_backend local \
         --reasoning_effort high \
         --vllm_server_url "$VLLM_SERVER_URL" \
+        --max_rounds "$MAX_ROUNDS" \
         --max_concurrency_per_worker "$MAX_CONCURRENCY"
 }
 

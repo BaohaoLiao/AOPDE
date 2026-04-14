@@ -15,7 +15,8 @@ NUM_SERVERS="${NUM_SERVERS:-7}"
 MODEL_PATH="${MODEL_PATH:-/data/agenthle/baohao/LLMs/OpenResearcher/OpenResearcher-30B-A3B}"
 DATA_PATH="${DATA_PATH:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus/data/*.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/OpenResearcher_dense_7x1}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-48}"
+MAX_ROUNDS="${MAX_ROUNDS:-600}"
 BROWSER_BACKEND="${BROWSER_BACKEND:-local}"
 CHECK_SERVICES="${CHECK_SERVICES:-1}"
 SHOW_AGENT_LOGS="${SHOW_AGENT_LOGS:-0}"
@@ -45,6 +46,7 @@ Configurable environment variables:
   DATA_PATH         BrowseComp Plus parquet glob
   OUTPUT_DIR        Output directory for result shards
   MAX_CONCURRENCY   Max concurrency per worker (default: ${MAX_CONCURRENCY})
+    MAX_ROUNDS        Max agent rounds per task (default: ${MAX_ROUNDS})
   BROWSER_BACKEND   Browser backend (default: ${BROWSER_BACKEND})
   CHECK_SERVICES    1 to verify endpoints before running, 0 to skip
     SHOW_AGENT_LOGS   1 to stream deploy_agent logs to terminal, 0 to write them to RUN_LOG only
@@ -221,6 +223,7 @@ main() {
     echo "  Model path: ${MODEL_PATH}"
     echo "  Data path: ${DATA_PATH}"
     echo "  Total tasks: ${total_tasks}"
+    echo "  Max rounds: ${MAX_ROUNDS}"
     echo "  Log file: ${RUN_LOG}"
 
     cd "$OPENRESEARCHER_DIR"
@@ -236,6 +239,7 @@ main() {
             --browser_backend "$BROWSER_BACKEND" \
             --reasoning_effort high \
             --vllm_server_url "$server_urls" \
+            --max_rounds "$MAX_ROUNDS" \
             --max_concurrency_per_worker "$MAX_CONCURRENCY" \
             2>&1 | tee -a "$RUN_LOG" &
     else
@@ -248,6 +252,7 @@ main() {
             --browser_backend "$BROWSER_BACKEND" \
             --reasoning_effort high \
             --vllm_server_url "$server_urls" \
+            --max_rounds "$MAX_ROUNDS" \
             --max_concurrency_per_worker "$MAX_CONCURRENCY" \
             > "$RUN_LOG" 2>&1 &
     fi

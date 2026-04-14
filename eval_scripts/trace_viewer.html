@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenResearcher Trace Viewer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe6;
+      --panel: #fffaf3;
+      --panel-strong: #fff;
+      --border: #d8c9b4;
+      --text: #1f1a17;
+      --muted: #6e6258;
+      --accent: #9a3412;
+      --accent-soft: #fed7aa;
+      --ok: #166534;
+      --ok-soft: #dcfce7;
+      --fail: #991b1b;
+      --fail-soft: #fee2e2;
+      --system: #1d4ed8;
+      --system-soft: #dbeafe;
+      --user: #7c2d12;
+      --user-soft: #ffedd5;
+      --assistant: #14532d;
+      --assistant-soft: #dcfce7;
+      --tool: #5b21b6;
+      --tool-soft: #ede9fe;
+      --shadow: 0 12px 40px rgba(58, 45, 31, 0.12);
+      --radius: 18px;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      --sans: "Segoe UI", "Helvetica Neue", Helvetica, Arial, sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: var(--sans);
+      color: var(--text);
+      background:
+        radial-gradient(circle at top left, rgba(251, 191, 36, 0.18), transparent 28%),
+        radial-gradient(circle at top right, rgba(249, 115, 22, 0.12), transparent 26%),
+        linear-gradient(180deg, #f9f5ee 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 360px 1fr;
+      gap: 20px;
+      padding: 20px;
+      min-height: 100vh;
+    }
+
+    .panel {
+      background: rgba(255, 250, 243, 0.92);
+      border: 1px solid rgba(216, 201, 180, 0.8);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+    }
+
+    .sidebar {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      overflow: hidden;
+    }
+
+    .hero {
+      padding: 18px 18px 14px;
+      border-bottom: 1px solid var(--border);
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.18), rgba(249, 115, 22, 0.08));
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 24px;
+      line-height: 1.1;
+    }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    .controls {
+      padding: 16px 18px;
+      display: grid;
+      gap: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .button-row,
+    .filter-row,
+    .summary-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    button,
+    select,
+    input[type="search"] {
+      font: inherit;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      background: var(--panel-strong);
+      color: var(--text);
+    }
+
+    button {
+      cursor: pointer;
+      padding: 9px 12px;
+      background: linear-gradient(180deg, #fff, #f8efe2);
+      transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      border-color: #caa47b;
+      box-shadow: 0 6px 18px rgba(122, 82, 40, 0.12);
+    }
+
+    input[type="search"],
+    select {
+      width: 100%;
+      padding: 10px 12px;
+      min-width: 0;
+    }
+
+    .summary-pill,
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+      border: 1px solid transparent;
+    }
+
+    .summary-pill {
+      background: #f3e8d8;
+      color: #5c4732;
+      border-color: #e5d2b8;
+    }
+
+    .badge.success {
+      background: var(--ok-soft);
+      color: var(--ok);
+      border-color: #a7f3d0;
+    }
+
+    .badge.fail {
+      background: var(--fail-soft);
+      color: var(--fail);
+      border-color: #fecaca;
+    }
+
+    .badge.correct {
+      background: var(--ok-soft);
+      color: var(--ok);
+      border-color: #a7f3d0;
+    }
+
+    .badge.incorrect {
+      background: #fef3c7;
+      color: #92400e;
+      border-color: #fde68a;
+    }
+
+    .status-box {
+      padding: 10px 12px;
+      border-radius: 14px;
+      font-size: 13px;
+      line-height: 1.45;
+      background: #fbf7f0;
+      border: 1px dashed #d8c9b4;
+      color: var(--muted);
+    }
+
+    .trace-list {
+      overflow: auto;
+      padding: 8px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .trace-item {
+      width: 100%;
+      text-align: left;
+      border: 1px solid rgba(214, 196, 171, 0.9);
+      border-radius: 16px;
+      padding: 12px;
+      background: rgba(255, 255, 255, 0.78);
+    }
+
+    .trace-item.active {
+      border-color: rgba(154, 52, 18, 0.8);
+      box-shadow: 0 10px 20px rgba(154, 52, 18, 0.14);
+      background: linear-gradient(180deg, rgba(255, 244, 230, 0.95), rgba(255, 255, 255, 0.95));
+    }
+
+    .trace-item header {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      align-items: start;
+      margin-bottom: 8px;
+    }
+
+    .trace-item .qid {
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .trace-item .meta,
+    .mini-meta {
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .trace-item .question {
+      margin-top: 8px;
+      font-size: 13px;
+      line-height: 1.45;
+      color: #3c3129;
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+      overflow: hidden;
+    }
+
+    .main {
+      min-width: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .detail-header {
+      padding: 24px;
+      border-bottom: 1px solid var(--border);
+      background:
+        linear-gradient(135deg, rgba(249, 115, 22, 0.14), rgba(251, 191, 36, 0.12)),
+        linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.6));
+    }
+
+    .detail-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-top: 18px;
+    }
+
+    .detail-card {
+      padding: 14px;
+      border-radius: 14px;
+      background: rgba(255,255,255,0.78);
+      border: 1px solid rgba(216, 201, 180, 0.85);
+    }
+
+    .detail-card strong {
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .question-full,
+    .answer-full,
+    pre,
+    code {
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .timeline {
+      padding: 18px 24px 24px;
+      overflow: auto;
+      display: grid;
+      gap: 14px;
+    }
+
+    .message {
+      border-radius: 18px;
+      padding: 16px;
+      border: 1px solid transparent;
+      background: rgba(255,255,255,0.75);
+    }
+
+    .message.system {
+      background: var(--system-soft);
+      border-color: #93c5fd;
+    }
+
+    .message.user {
+      background: var(--user-soft);
+      border-color: #fdba74;
+    }
+
+    .message.assistant {
+      background: var(--assistant-soft);
+      border-color: #86efac;
+    }
+
+    .message.tool {
+      background: var(--tool-soft);
+      border-color: #c4b5fd;
+    }
+
+    .message header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .role-chip {
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-size: 11px;
+    }
+
+    .message.system .role-chip { color: var(--system); }
+    .message.user .role-chip { color: var(--user); }
+    .message.assistant .role-chip { color: var(--assistant); }
+    .message.tool .role-chip { color: var(--tool); }
+
+    .message-body {
+      font-size: 14px;
+      line-height: 1.55;
+      color: #201b18;
+    }
+
+    .message-section {
+      margin-top: 12px;
+      padding-top: 12px;
+      border-top: 1px dashed rgba(94, 81, 67, 0.22);
+    }
+
+    .message-section strong {
+      display: block;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    details {
+      border-radius: 12px;
+      background: rgba(255,255,255,0.45);
+      padding: 10px 12px;
+    }
+
+    details > summary {
+      cursor: pointer;
+      font-weight: 600;
+      color: #4a3c31;
+    }
+
+    pre {
+      margin: 0;
+      padding: 12px;
+      border-radius: 12px;
+      background: rgba(32, 27, 24, 0.9);
+      color: #f8f2ea;
+      font-size: 12px;
+      line-height: 1.5;
+      font-family: var(--mono);
+      overflow: auto;
+    }
+
+    .empty {
+      display: grid;
+      place-items: center;
+      padding: 60px 24px;
+      color: var(--muted);
+      text-align: center;
+      min-height: 320px;
+    }
+
+    .hidden-input {
+      display: none;
+    }
+
+    .footnote {
+      margin-top: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    @media (max-width: 1080px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        max-height: 45vh;
+      }
+
+      .detail-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="panel sidebar">
+      <div class="hero">
+        <h1>Trace Viewer</h1>
+        <p class="subtitle">Inspect OpenResearcher task traces, tool calls, reasoning spans, and final answers from shard JSONL files.</p>
+      </div>
+
+      <div class="controls">
+        <div class="button-row">
+          <button id="autoload-button" type="button">Auto-load Local Shards</button>
+          <button id="files-button" type="button">Open Files</button>
+          <button id="directory-button" type="button">Open Folder</button>
+        </div>
+
+        <input id="file-input" class="hidden-input" type="file" accept=".json,.jsonl" multiple>
+        <input id="directory-input" class="hidden-input" type="file" accept=".json,.jsonl" webkitdirectory multiple>
+
+        <div class="status-box" id="status-box">
+          Ready. If this file is served from the trace directory, Auto-load will read the shard JSONL files directly. If you opened it as a local file and fetch is blocked, use Open Files or Open Folder.
+        </div>
+
+        <input id="search-input" type="search" placeholder="Search qid, question, answer, or tool content">
+
+        <div class="filter-row">
+          <select id="status-filter">
+            <option value="all">All statuses</option>
+            <option value="success">Success only</option>
+            <option value="fail">Fail only</option>
+          </select>
+          <select id="sort-filter">
+            <option value="qid-asc">Sort by qid asc</option>
+            <option value="qid-desc">Sort by qid desc</option>
+            <option value="latency-desc">Sort by latency desc</option>
+            <option value="messages-desc">Sort by messages desc</option>
+          </select>
+        </div>
+
+        <div class="summary-row" id="summary-row"></div>
+        <div class="footnote" id="load-meta"></div>
+      </div>
+
+      <div class="trace-list" id="trace-list"></div>
+    </aside>
+
+    <main class="panel main">
+      <div id="detail-root" class="empty">
+        Load a trace set, then select a task on the left.
+      </div>
+    </main>
+  </div>
+
+  <script>
+    const DEFAULT_SHARDS = Array.from({ length: 32 }, (_, index) => `node_0_shard_${index}.jsonl`);
+    const DEFAULT_EXTRA_FILES = ["eval_results.json"];
+
+    const state = {
+      records: [],
+      filteredRecords: [],
+      selectedQid: null,
+      evalByQid: new Map(),
+      loadedFiles: [],
+      duplicateCount: 0,
+      duplicateQids: new Set(),
+    };
+
+    const elements = {
+      statusBox: document.getElementById("status-box"),
+      searchInput: document.getElementById("search-input"),
+      statusFilter: document.getElementById("status-filter"),
+      sortFilter: document.getElementById("sort-filter"),
+      traceList: document.getElementById("trace-list"),
+      detailRoot: document.getElementById("detail-root"),
+      summaryRow: document.getElementById("summary-row"),
+      loadMeta: document.getElementById("load-meta"),
+      autoloadButton: document.getElementById("autoload-button"),
+      fileButton: document.getElementById("files-button"),
+      directoryButton: document.getElementById("directory-button"),
+      fileInput: document.getElementById("file-input"),
+      directoryInput: document.getElementById("directory-input"),
+    };
+
+    function setStatus(message, isError = false) {
+      elements.statusBox.textContent = message;
+      elements.statusBox.style.borderColor = isError ? "#fca5a5" : "#d8c9b4";
+      elements.statusBox.style.color = isError ? "#991b1b" : "#6e6258";
+      elements.statusBox.style.background = isError ? "#fff1f2" : "#fbf7f0";
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function truncate(text, limit = 180) {
+      const value = String(text ?? "").trim();
+      return value.length > limit ? `${value.slice(0, limit - 1)}...` : value;
+    }
+
+    function formatLatency(value) {
+      if (typeof value !== "number" || Number.isNaN(value)) {
+        return "-";
+      }
+      if (value < 60) {
+        return `${value.toFixed(1)}s`;
+      }
+      const minutes = Math.floor(value / 60);
+      const seconds = value % 60;
+      return `${minutes}m ${seconds.toFixed(0)}s`;
+    }
+
+    function safeJson(value) {
+      try {
+        return JSON.stringify(value, null, 2);
+      } catch {
+        return String(value);
+      }
+    }
+
+    function parseJsonLines(text) {
+      return text
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+    }
+
+    function mergeEvalResults(records) {
+      for (const record of records) {
+        if (record && record.qid !== undefined) {
+          state.evalByQid.set(record.qid, record);
+        }
+      }
+    }
+
+    function registerTraceRecords(records) {
+      const byQid = new Map(state.records.map((record) => [record.qid, record]));
+
+      for (const record of records) {
+        if (!record || record.qid === undefined) {
+          continue;
+        }
+        if (byQid.has(record.qid)) {
+          state.duplicateCount += 1;
+          state.duplicateQids.add(record.qid);
+        }
+        byQid.set(record.qid, record);
+      }
+
+      state.records = Array.from(byQid.values());
+    }
+
+    function ingestFileContent(name, text) {
+      const records = parseJsonLines(text);
+      if (name === "eval_results.json" || name.startsWith("evaluated_")) {
+        mergeEvalResults(records);
+      } else {
+        registerTraceRecords(records);
+      }
+      state.loadedFiles.push(name);
+    }
+
+    async function fetchText(path) {
+      const response = await fetch(path);
+      if (!response.ok) {
+        throw new Error(`${path}: ${response.status}`);
+      }
+      return response.text();
+    }
+
+    async function autoLoadFromCurrentDirectory() {
+      state.records = [];
+      state.filteredRecords = [];
+      state.evalByQid = new Map();
+      state.loadedFiles = [];
+      state.duplicateCount = 0;
+      state.duplicateQids = new Set();
+
+      let loadedShardCount = 0;
+      const missing = [];
+
+      for (const fileName of DEFAULT_SHARDS) {
+        try {
+          const text = await fetchText(fileName);
+          ingestFileContent(fileName, text);
+          loadedShardCount += 1;
+        } catch (error) {
+          missing.push(fileName);
+        }
+      }
+
+      for (const extraFile of DEFAULT_EXTRA_FILES) {
+        try {
+          const text = await fetchText(extraFile);
+          ingestFileContent(extraFile, text);
+        } catch {
+        }
+      }
+
+      if (!loadedShardCount) {
+        throw new Error("No shard files could be fetched from the current directory.");
+      }
+
+      setStatus(`Loaded ${loadedShardCount} shard files from the current directory.${missing.length ? ` Missing ${missing.length} shard slots were ignored.` : ""}`);
+      applyFilters();
+    }
+
+    async function loadFilesFromInput(fileList) {
+      state.records = [];
+      state.filteredRecords = [];
+      state.evalByQid = new Map();
+      state.loadedFiles = [];
+      state.duplicateCount = 0;
+      state.duplicateQids = new Set();
+
+      const files = Array.from(fileList).filter((file) => file.name.endsWith(".json") || file.name.endsWith(".jsonl"));
+      if (!files.length) {
+        throw new Error("No .json or .jsonl files were selected.");
+      }
+
+      for (const file of files.sort((left, right) => left.name.localeCompare(right.name))) {
+        const text = await file.text();
+        ingestFileContent(file.name, text);
+      }
+
+      setStatus(`Loaded ${files.length} selected files.`);
+      applyFilters();
+    }
+
+    function buildSearchBlob(record) {
+      const parts = [record.qid, record.status, record.question, record.answer, record.error];
+      for (const message of record.messages || []) {
+        parts.push(message.role, message.content, message.reasoning_content, safeJson(message.tool_calls));
+      }
+      return parts.join("\n").toLowerCase();
+    }
+
+    function applyFilters() {
+      const query = elements.searchInput.value.trim().toLowerCase();
+      const status = elements.statusFilter.value;
+      const sort = elements.sortFilter.value;
+
+      state.filteredRecords = state.records.filter((record) => {
+        if (status !== "all" && String(record.status || "") !== status) {
+          return false;
+        }
+        if (query && !buildSearchBlob(record).includes(query)) {
+          return false;
+        }
+        return true;
+      });
+
+      state.filteredRecords.sort((left, right) => {
+        switch (sort) {
+          case "qid-desc":
+            return Number(right.qid) - Number(left.qid);
+          case "latency-desc":
+            return (right.latency_s || 0) - (left.latency_s || 0);
+          case "messages-desc":
+            return (right.messages?.length || 0) - (left.messages?.length || 0);
+          case "qid-asc":
+          default:
+            return Number(left.qid) - Number(right.qid);
+        }
+      });
+
+      if (!state.filteredRecords.length) {
+        state.selectedQid = null;
+      } else if (!state.filteredRecords.some((record) => record.qid === state.selectedQid)) {
+        state.selectedQid = state.filteredRecords[0].qid;
+      }
+
+      renderSummary();
+      renderTraceList();
+      renderDetail();
+    }
+
+    function renderSummary() {
+      const total = state.records.length;
+      const shown = state.filteredRecords.length;
+      const success = state.records.filter((record) => record.status === "success").length;
+      const fail = state.records.filter((record) => record.status !== "success").length;
+      const judged = state.records.filter((record) => state.evalByQid.has(record.qid)).length;
+      const correct = state.records.filter((record) => state.evalByQid.get(record.qid)?.correct === true).length;
+
+      const pills = [
+        `Total ${total}`,
+        `Shown ${shown}`,
+        `Success ${success}`,
+        `Fail ${fail}`,
+        `Judged ${judged}`,
+      ];
+      if (judged) {
+        pills.push(`Correct ${correct}`);
+      }
+      if (state.duplicateCount) {
+        pills.push(`Duplicates ${state.duplicateCount}`);
+      }
+
+      elements.summaryRow.innerHTML = pills
+        .map((text) => `<span class="summary-pill">${escapeHtml(text)}</span>`)
+        .join("");
+
+      elements.loadMeta.textContent = state.loadedFiles.length
+        ? `Loaded files: ${state.loadedFiles.join(", ")}`
+        : "";
+    }
+
+    function renderTraceList() {
+      if (!state.filteredRecords.length) {
+        elements.traceList.innerHTML = `<div class="empty">No matching traces.</div>`;
+        return;
+      }
+
+      elements.traceList.innerHTML = state.filteredRecords.map((record) => {
+        const evalResult = state.evalByQid.get(record.qid);
+        const badges = [];
+        badges.push(`<span class="badge ${record.status === "success" ? "success" : "fail"}">${escapeHtml(record.status || "unknown")}</span>`);
+        if (evalResult) {
+          badges.push(`<span class="badge ${evalResult.correct ? "correct" : "incorrect"}">${evalResult.correct ? "correct" : "incorrect"}</span>`);
+        }
+        if (state.duplicateQids.has(record.qid)) {
+          badges.push(`<span class="summary-pill">deduped</span>`);
+        }
+
+        return `
+          <button class="trace-item ${record.qid === state.selectedQid ? "active" : ""}" data-qid="${escapeHtml(record.qid)}" type="button">
+            <header>
+              <div>
+                <div class="qid">QID ${escapeHtml(record.qid)}</div>
+                <div class="mini-meta">
+                  <span>${escapeHtml(formatLatency(record.latency_s))}</span>
+                  <span>${escapeHtml((record.messages || []).length)} msgs</span>
+                  <span>${escapeHtml(record.attempts || 0)} tries</span>
+                </div>
+              </div>
+              <div>${badges.join(" ")}</div>
+            </header>
+            <div class="question">${escapeHtml(record.question || "")}</div>
+          </button>
+        `;
+      }).join("");
+
+      for (const button of elements.traceList.querySelectorAll(".trace-item")) {
+        button.addEventListener("click", () => {
+          state.selectedQid = Number(button.dataset.qid);
+          renderTraceList();
+          renderDetail();
+        });
+      }
+    }
+
+    function renderMessage(message, index) {
+      const role = String(message.role || "unknown");
+      const content = message.content == null ? "" : typeof message.content === "string" ? message.content : safeJson(message.content);
+      const toolCalls = message.tool_calls ? safeJson(message.tool_calls) : "";
+      const reasoning = message.reasoning_content || "";
+
+      return `
+        <article class="message ${escapeHtml(role)}">
+          <header>
+            <span class="role-chip">${escapeHtml(role)}</span>
+            <span class="mini-meta">
+              <span>#${index}</span>
+              ${message.tool_call_id ? `<span>tool_call_id ${escapeHtml(message.tool_call_id)}</span>` : ""}
+            </span>
+          </header>
+          <div class="message-body">${escapeHtml(content) || "<em>empty</em>"}</div>
+          ${reasoning ? `
+            <div class="message-section">
+              <strong>Reasoning</strong>
+              <details>
+                <summary>Show reasoning content</summary>
+                <pre>${escapeHtml(reasoning)}</pre>
+              </details>
+            </div>
+          ` : ""}
+          ${toolCalls ? `
+            <div class="message-section">
+              <strong>Tool Calls</strong>
+              <pre>${escapeHtml(toolCalls)}</pre>
+            </div>
+          ` : ""}
+        </article>
+      `;
+    }
+
+    function renderDetail() {
+      const record = state.records.find((item) => item.qid === state.selectedQid);
+      if (!record) {
+        elements.detailRoot.className = "empty";
+        elements.detailRoot.innerHTML = "Select a task to inspect its trace.";
+        return;
+      }
+
+      const evalResult = state.evalByQid.get(record.qid);
+      const summaryBadges = [
+        `<span class="badge ${record.status === "success" ? "success" : "fail"}">${escapeHtml(record.status || "unknown")}</span>`,
+      ];
+      if (evalResult) {
+        summaryBadges.push(`<span class="badge ${evalResult.correct ? "correct" : "incorrect"}">${evalResult.correct ? "correct" : "incorrect"}</span>`);
+      }
+      if (state.duplicateQids.has(record.qid)) {
+        summaryBadges.push(`<span class="summary-pill">deduped qid</span>`);
+      }
+
+      elements.detailRoot.className = "";
+      elements.detailRoot.innerHTML = `
+        <div class="detail-header">
+          <div class="mini-meta">${summaryBadges.join(" ")}</div>
+          <h1 style="margin-top: 10px;">QID ${escapeHtml(record.qid)}</h1>
+          <div class="question-full">${escapeHtml(record.question || "")}</div>
+
+          <div class="detail-grid">
+            <div class="detail-card">
+              <strong>Gold Answer</strong>
+              <div class="answer-full">${escapeHtml(record.answer || "")}</div>
+            </div>
+            <div class="detail-card">
+              <strong>Run Metadata</strong>
+              <div class="mini-meta">
+                <span>Latency ${escapeHtml(formatLatency(record.latency_s))}</span>
+                <span>Attempts ${escapeHtml(record.attempts || 0)}</span>
+                <span>Messages ${escapeHtml((record.messages || []).length)}</span>
+              </div>
+              ${record.error ? `<div class="message-section"><strong>Error</strong><pre>${escapeHtml(record.error)}</pre></div>` : ""}
+            </div>
+            ${evalResult ? `
+              <div class="detail-card">
+                <strong>Evaluation</strong>
+                <div class="mini-meta">
+                  <span>${evalResult.correct ? "Correct" : "Incorrect"}</span>
+                  ${evalResult.question ? `<span>${escapeHtml(truncate(evalResult.question, 90))}</span>` : ""}
+                </div>
+                ${evalResult.content ? `<div class="message-section"><strong>Judge Output</strong><pre>${escapeHtml(evalResult.content)}</pre></div>` : ""}
+              </div>
+            ` : ""}
+            <div class="detail-card">
+              <strong>Final Assistant Message</strong>
+              <div class="answer-full">${escapeHtml(getFinalAssistantContent(record.messages || []))}</div>
+            </div>
+          </div>
+        </div>
+        <div class="timeline">
+          ${(record.messages || []).map((message, index) => renderMessage(message, index)).join("")}
+        </div>
+      `;
+    }
+
+    function getFinalAssistantContent(messages) {
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const message = messages[index];
+        if (message.role === "assistant" && message.content) {
+          return typeof message.content === "string" ? message.content : safeJson(message.content);
+        }
+      }
+      return "";
+    }
+
+    elements.searchInput.addEventListener("input", applyFilters);
+    elements.statusFilter.addEventListener("change", applyFilters);
+    elements.sortFilter.addEventListener("change", applyFilters);
+
+    elements.autoloadButton.addEventListener("click", async () => {
+      try {
+        setStatus("Loading shard files from the current directory...");
+        await autoLoadFromCurrentDirectory();
+      } catch (error) {
+        setStatus(`${error.message} Use Open Files or Open Folder if this page was opened via file://.`, true);
+      }
+    });
+
+    elements.fileButton.addEventListener("click", () => elements.fileInput.click());
+    elements.directoryButton.addEventListener("click", () => elements.directoryInput.click());
+
+    elements.fileInput.addEventListener("change", async (event) => {
+      try {
+        await loadFilesFromInput(event.target.files);
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        event.target.value = "";
+      }
+    });
+
+    elements.directoryInput.addEventListener("change", async (event) => {
+      try {
+        await loadFilesFromInput(event.target.files);
+      } catch (error) {
+        setStatus(error.message, true);
+      } finally {
+        event.target.value = "";
+      }
+    });
+  </script>
+</body>
+</html>
