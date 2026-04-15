@@ -11,11 +11,11 @@ RESULTS_ROOT="${RESULTS_ROOT:-/data/agenthle/baohao/agentic_opd/openresearcher_r
 
 SEARCH_URL="${SEARCH_URL:-http://localhost:8000}"
 MODEL_BASE_PORT="${MODEL_BASE_PORT:-8001}"
-NUM_SERVERS="${NUM_SERVERS:-7}"
+NUM_SERVERS="${NUM_SERVERS:-1}"
 MODEL_PATH="${MODEL_PATH:-/data/agenthle/baohao/LLMs/OpenResearcher/OpenResearcher-30B-A3B}"
 DATA_PATH="${DATA_PATH:-${OPENRESEARCHER_DIR}/Tevatron/browsecomp-plus/data/*.parquet}"
 OUTPUT_DIR="${OUTPUT_DIR:-${RESULTS_ROOT}/browsecomp_plus/OpenResearcher_dense_7x1}"
-MAX_CONCURRENCY="${MAX_CONCURRENCY:-48}"
+MAX_CONCURRENCY="${MAX_CONCURRENCY:-32}"
 MAX_ROUNDS="${MAX_ROUNDS:-600}"
 BROWSER_BACKEND="${BROWSER_BACKEND:-local}"
 CHECK_SERVICES="${CHECK_SERVICES:-1}"
