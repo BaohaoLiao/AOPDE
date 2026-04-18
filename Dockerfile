@@ -117,8 +117,9 @@ RUN git clone ${SLIME_REPO} ${BASE_DIR}/slime && \
     python -m pip install -e . && \
     rm -rf ${BASE_DIR}/slime/.git
 
-RUN python -m pip uninstall -y wandb || true && \
-    rm -rf /opt/conda/lib/python3.12/site-packages/wandb /opt/conda/lib/python3.12/site-packages/wandb-*.dist-info
+# slime imports wandb from its logging utilities at module import time, including
+# the HF->torch-dist conversion tool. Keep wandb installed so those entrypoints
+# can start even when experiment tracking is disabled.
 
 RUN python -m pip install nvidia-cudnn-cu12==9.16.0.29 && \
     python -m pip install "numpy<2"
