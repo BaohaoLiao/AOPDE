@@ -77,6 +77,30 @@ def get_args():
     return args
 
 
+def _attention_backend_is_auto(attention_backend) -> bool:
+    name = getattr(attention_backend, "name", None)
+    if name is not None:
+        return name == "auto"
+    value = str(attention_backend)
+    return value == "auto" or value.endswith(".auto")
+
+
+def _clear_conflicting_nvte_attention_env(attention_backend):
+    if not _attention_backend_is_auto(attention_backend):
+        return
+
+    cleared = []
+    for env_name in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+        if env_name in os.environ:
+            cleared.append(f"{env_name}={os.environ.pop(env_name)}")
+
+    if cleared:
+        print(
+            "[NVTE] Cleared conflicting attention env overrides for "
+            f"--attention-backend auto: {', '.join(cleared)}"
+        )
+
+
 def main():
     if torch.version.hip:
         import megatron.core.dist_checkpointing.strategies.filesystem_async as filesystem_async_module
@@ -105,6 +129,7 @@ def main():
         device_id=torch.device(f"cuda:{local_rank}"),
     )
     args = get_args()
+    _clear_conflicting_nvte_attention_env(args.attention_backend)
     init(args)
 
     # if using AMD gpus, we have to do the conversion in cpu
