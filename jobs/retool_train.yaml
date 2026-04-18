@@ -1,0 +1,43 @@
+description: "Agentic OPD: ReTool RL Teacher"
+
+target:
+  service: sing
+  name: palisades33 #msrresrchbasicvc # palisades33
+  workspace_name: shared_ws
+
+environment:
+  registry: 98ada19bea534cb0ab6e12b2d249e5fb.azurecr.io
+  image: baohao/slime:h100
+
+code:
+  local_dir: /home/t-baohaoliao/agentic_opd/AOPDE
+
+storage:
+  output:
+    storage_account_name: singaporeteamstorage
+    container_name: shared
+    mount_dir: /mnt/default_storage
+    mount_options: []
+
+env_defaults:
+  USER: root
+
+jobs:
+  - name: retool-rl-teacher
+    sku: NDv4 # 80G1-H100 # 40G1-A100 # 80G2-H100 # 40G1-A100 #40G8-A100-NvLink
+    priority: high
+    sla_tier: premium # standard # premium
+    identity: managed
+    command:
+      - set -euo pipefail
+      - echo "Running ReTool RL Teacher..."
+      - nvidia-smi
+    submit_args:
+      max_run_duration_seconds: 1206400
+      env:
+        {
+          AMLT_BLOB_ROOT_DIR: /mnt/default_storage,
+          _AZUREML_SINGULARITY_JOB_UAI: "/subscriptions/e033d461-1923-44a7-872b-78f1d35a86dd/resourcegroups/SingaporeTeam/providers/Microsoft.ManagedIdentity/userAssignedIdentities/shared_mi",
+          WANDB_MODE: "online",
+          WANDB_API_KEY: "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",
+        }
