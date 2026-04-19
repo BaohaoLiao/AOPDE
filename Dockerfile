@@ -40,6 +40,7 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/u
       libcudnn9-dev-cuda-12 \
       libnccl-dev \
       libnccl2 \
+      libnuma1 \
       ninja-build \
       patch \
       pkg-config \
@@ -109,17 +110,17 @@ RUN git clone --recursive https://github.com/NVIDIA/Megatron-LM.git ${BASE_DIR}/
     python -m pip install -e . && \
     rm -rf ${BASE_DIR}/Megatron-LM/.git
 
-# The original script copies a local slime checkout into the image. Because this
-# repository only contains the Dockerfile, clone the upstream repo instead.
-RUN git clone ${SLIME_REPO} ${BASE_DIR}/slime && \
-    cd ${BASE_DIR}/slime && \
-    if [[ -n "${SLIME_REF}" ]]; then git checkout "${SLIME_REF}"; fi && \
+# Install the local slime checkout so image rebuilds pick up in-repo patches.
+COPY third_party/slime ${BASE_DIR}/slime
+RUN cd ${BASE_DIR}/slime && \
     python -m pip install -e . && \
     rm -rf ${BASE_DIR}/slime/.git
 
 # slime imports wandb from its logging utilities at module import time, including
 # the HF->torch-dist conversion tool. Keep wandb installed so those entrypoints
-# can start even when experiment tracking is disabled.
+# can start even when experiment tracking is disabled. The scanner finding is
+# against the bundled wandb-core binary; PyPI publishes wandb as 0.x releases.
+RUN python -m pip install "wandb==0.26.0"
 
 RUN python -m pip install nvidia-cudnn-cu12==9.16.0.29 && \
     python -m pip install "numpy<2"
@@ -127,6 +128,13 @@ RUN python -m pip install nvidia-cudnn-cu12==9.16.0.29 && \
 RUN python - <<'PY'
 import torch
 print(f"torch CUDA: {torch.version.cuda}")
+import flash_attn
+print(f"flash_attn: {flash_attn.__version__}")
+try:
+    import sgl_kernel
+    print("sgl_kernel OK")
+except ImportError as exc:
+    print(f"sgl_kernel check skipped during image build: {exc}")
 import fused_weight_gradient_mlp_cuda
 print("gradient_accumulation_fusion OK")
 import amp_C

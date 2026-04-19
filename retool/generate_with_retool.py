@@ -224,27 +224,37 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
 
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    if args.rollout_max_context_len is not None:
+        max_context_length = args.rollout_max_context_len
+    else:
+        max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
     response = ""
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0  # Track actual tool call rounds
+    last_finish_reason = None
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
         # Check if total length exceeds max context length
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
-        if args.rollout_max_context_len is not None:
-            max_context_length = args.rollout_max_context_len
-        else:
-            max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
+        remaining_context = max_context_length - total_length
 
         # Use token IDs instead of text
         current_token_ids = prompt_tokens_ids + response_token_ids
+        current_sampling_params = dict(sampling_params)
+        current_sampling_params["max_new_tokens"] = min(
+            current_sampling_params["max_new_tokens"],
+            remaining_context,
+        )
+        if current_sampling_params["max_new_tokens"] <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            break
         payload = {
             "input_ids": current_token_ids,
-            "sampling_params": sampling_params,
+            "sampling_params": current_sampling_params,
             "return_logprob": True,  # Request log probabilities for training
         }
 
@@ -271,8 +281,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         output = await post(url, payload)
 
+        last_finish_reason = output["meta_info"]["finish_reason"]["type"]
+
         # Handle abort
-        if output["meta_info"]["finish_reason"]["type"] == "abort":
+        if last_finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
             return sample
 
@@ -294,7 +306,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         loss_masks += [1] * len(cur_response_token_ids)
 
         # Check length limit
-        if output["meta_info"]["finish_reason"]["type"] == "length":
+        if last_finish_reason == "length":
+            sample.status = Sample.Status.TRUNCATED
             break
 
         next_obs, done = await execute_predictions(cur_response)
@@ -308,6 +321,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+        remaining_context = max_context_length - (len(prompt_tokens_ids) + len(response_token_ids))
+        if remaining_context <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            break
+        if len(obs_tokens_ids) > remaining_context:
+            obs_tokens_ids = obs_tokens_ids[:remaining_context]
+            next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
+            sample.status = Sample.Status.TRUNCATED
         response += next_obs
         response_token_ids += obs_tokens_ids
         loss_masks += [0] * len(obs_tokens_ids)
@@ -320,6 +341,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             assert len(response_token_ids) == len(
                 sample.rollout_log_probs
             ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
+
+        if sample.status == Sample.Status.TRUNCATED:
+            break
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             break
@@ -339,13 +363,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.tool_call_count = tool_call_count
 
     # Set status
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    if sample.status not in {Sample.Status.TRUNCATED, Sample.Status.ABORTED}:
+        match last_finish_reason:
+            case "length":
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
 
     return sample
 

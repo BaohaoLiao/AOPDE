@@ -24,6 +24,8 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
+MEGATRON_ROOT="${MEGATRON_ROOT:-/opt/Megatron-LM}"
+SLIME_ROOT="${SLIME_ROOT:-/opt/slime}"
 source "./scripts/models/qwen3-4B.sh"
 
 MODEL_DIR=/data/agenthle/baohao/agentic_opd/retool/model
@@ -109,6 +111,10 @@ WANDB_ARGS=(
    --wandb-key ${WANDB_KEY}
 )
 
+TRAIN_ENV_ARGS=(
+   --train-env-vars "{\"NVTE_FLASH_ATTN\":\"${NVTE_FLASH_ATTN:-1}\",\"NVTE_FUSED_ATTN\":\"${NVTE_FUSED_ATTN:-1}\",\"NVTE_UNFUSED_ATTN\":\"${NVTE_UNFUSED_ATTN:-0}\",\"NVTE_DEBUG\":\"${NVTE_DEBUG:-0}\",\"NVTE_DEBUG_LEVEL\":\"${NVTE_DEBUG_LEVEL:-0}\"}"
+)
+
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.7
@@ -138,7 +144,7 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-s
 # Build the runtime environment JSON with proper variable substitution
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
-    \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}:/root/slime\",
+    \"PYTHONPATH\": \"${MEGATRON_ROOT}:${SCRIPT_DIR}:${SLIME_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
   }
@@ -155,6 +161,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${ROLLOUT_ARGS[@]} \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
+   ${TRAIN_ENV_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
    ${EVAL_ARGS[@]} \
