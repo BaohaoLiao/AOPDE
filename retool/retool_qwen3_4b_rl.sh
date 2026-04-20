@@ -57,7 +57,7 @@ ROLLOUT_ARGS=(
    --global-batch-size 256
    --balance-data
    --save-debug-rollout-data ${ROLLOUT_DEBUG_DIR}/rollout_{rollout_id}.pt
-   --disable-rollout-trim-samples
+   --use-dynamic-global-batch-size
 )
 
 EVAL_ARGS=(

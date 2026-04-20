@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import tempfile
+import uuid
 from contextlib import contextmanager
 from typing import Any
 
@@ -96,6 +97,7 @@ class PythonSandbox:
     def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
         self.timeout = timeout
         self.memory_limit = memory_limit
+        self._successful_code = ""
         self.allowed_modules = {
             "math",
             "random",
@@ -164,6 +166,10 @@ class PythonSandbox:
 
         return True, "Code is safe"
 
+    def get_effective_code(self, code: str) -> str:
+        """Get the code that will actually be executed in the sandbox."""
+        return code if not self._successful_code else f"{self._successful_code}\n\n{code}"
+
     @contextmanager
     def _create_safe_environment(self):
         """Create safe execution environment with temporary directory"""
@@ -203,10 +209,12 @@ class PythonSandbox:
         if not is_safe:
             return f"Error: {message}"
 
+        combined_code = self.get_effective_code(code)
+
         # Add necessary wrapper code with memory limits
         # Properly indent the user code within the try block
         # Handle indentation properly by adding 4 spaces to each line
-        indented_code = "\n".join("    " + line for line in code.split("\n"))
+        indented_code = "\n".join("    " + line for line in combined_code.split("\n"))
 
         wrapped_code = f"""import sys
 import traceback
@@ -255,7 +263,8 @@ except Exception as e:
     
     # Return error information
     error_msg = f"Error: {{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
-    print(error_msg)"""
+    print(error_msg)
+    sys.exit(1)"""
 
         with self._create_safe_environment() as (script_path, env, temp_dir):
             # Write code to file
@@ -279,8 +288,11 @@ except Exception as e:
 
                     if process.returncode == 0:
                         result = stdout.strip()
+                        self._successful_code = combined_code
                     else:
                         result = f"Error: Process exited with code {process.returncode}\n{stderr}"
+                        if stdout.strip():
+                            result = stdout.strip()
 
                 except subprocess.TimeoutExpired:
                     process.kill()
@@ -302,6 +314,7 @@ class ToolRegistry:
 
     def __init__(self):
         self.tools = {}
+        self.session_id = uuid.uuid4().hex[:8]
         self.python_sandbox = PythonSandbox(
             timeout=TOOL_CONFIGS["python_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
         )
@@ -333,6 +346,10 @@ class ToolRegistry:
     def get_tool_specs(self) -> list[dict[str, Any]]:
         """Get all tool specifications as a list"""
         return list(self.tools.values())
+
+    def get_effective_code(self, code: str) -> str:
+        """Get the effective Python code after attaching prior successful state."""
+        return self.python_sandbox.get_effective_code(code)
 
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool call with the given arguments"""

@@ -18,7 +18,7 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
+from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
 
 # Jinja2 template for tool-enabled conversations
 TOOL_TEMPLATE = """<|im_start|>system
@@ -180,7 +180,7 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
-async def execute_predictions(prediction: str) -> str:
+async def execute_predictions(prediction: str, tool_registry: ToolRegistry) -> str:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
@@ -189,9 +189,16 @@ async def execute_predictions(prediction: str) -> str:
         # postprocess_predictions)
         code = content.strip()
         if code:
+            effective_code = tool_registry.get_effective_code(code)
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("code_interpreter", {"code": code})
-            next_obs = f"\n\n<interpreter>\n{result}\n</interpreter>\n\n"
+            next_obs = (
+                "\n\n<interpreter>\n"
+                "Executed code:\n"
+                f"```python\n{effective_code}\n```\n\n"
+                f"{result}\n"
+                "</interpreter>\n\n"
+            )
             done = False
         else:
             next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
@@ -217,6 +224,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
 
     state = GenerateState(args)
+    tool_registry = ToolRegistry()
+    sandbox_session_id = tool_registry.session_id
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
@@ -228,6 +237,16 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         max_context_length = args.rollout_max_context_len
     else:
         max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
+
+    # Keep the sample structurally valid even if a later rollout turn aborts.
+    sample.tokens = list(prompt_tokens_ids)
+    sample.response = ""
+    sample.response_length = 0
+    sample.loss_mask = []
+    sample.sandbox_session_id = sandbox_session_id
+
+    print(f"[sandbox] session={sandbox_session_id} sample_start")
+
     response = ""
     response_token_ids = []
     loss_masks = []
@@ -272,12 +291,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     {
                         "debug/payload_length": len(prompt + response),
                         "debug/available_tools": available_tools,
+                        "debug/sandbox_session_id": sandbox_session_id,
                         "debug/tools_used": tools_used,
                         "debug/turn": turn,
                     }
                 )
         except ImportError:
             pass  # wandb not available
+
+        print(f"[sandbox] session={sandbox_session_id} turn={turn} tool_calls={tool_call_count}")
 
         output = await post(url, payload)
 
@@ -286,7 +308,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Handle abort
         if last_finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
-            return sample
+            break
 
         if "output_token_logprobs" in output["meta_info"]:
             cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
@@ -310,7 +332,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             break
 
-        next_obs, done = await execute_predictions(cur_response)
+        next_obs, done = await execute_predictions(cur_response, tool_registry)
         if done:
             break
 
@@ -358,6 +380,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.payload_text = prompt + response
     sample.payload_has_system = "<|im_start|>system" in prompt + response
     sample.payload_has_tools = "# Tools" in prompt + response
+    sample.sandbox_session_id = sandbox_session_id
 
     # Store tool call count for reward calculation
     sample.tool_call_count = tool_call_count
