@@ -29,7 +29,7 @@ You may call one function at a time to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{tools}
+__TOOLS__
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
@@ -58,7 +58,7 @@ def format_conversation_with_tools(
 
     if tools:
         tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tools)
-        system_content = f"{system_content}\n\n{TOOL_SYSTEM_PROMPT.format(tools=tool_lines)}"
+        system_content = f"{system_content}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
 
     messages_to_render.append({"role": "system", "content": system_content})
 
