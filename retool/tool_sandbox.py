@@ -7,6 +7,7 @@ This module provides:
 - Memory management utilities
 """
 
+import ast
 import asyncio
 import gc
 import os
@@ -154,14 +155,20 @@ class PythonSandbox:
             if re.search(pattern, code, re.IGNORECASE):
                 return False, f"Code contains dangerous pattern: {pattern}"
 
-        # Check imported modules
-        import_pattern = r"import\s+(\w+)"
-        from_pattern = r"from\s+(\w+)"
+        try:
+            tree = ast.parse(code)
+        except SyntaxError as exc:
+            return False, f"Code contains syntax error: {exc.msg}"
 
-        imports = re.findall(import_pattern, code)
-        froms = re.findall(from_pattern, code)
+        # Check imported modules from actual Python syntax only.
+        all_imports = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    all_imports.add(alias.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                all_imports.add(node.module.split(".")[0])
 
-        all_imports = set(imports + froms)
         for imp in all_imports:
             if imp not in self.allowed_modules:
                 return False, f"Import of '{imp}' is not allowed"
