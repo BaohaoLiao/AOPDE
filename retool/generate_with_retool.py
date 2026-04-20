@@ -3,11 +3,6 @@ import json
 import re
 from typing import Any
 
-try:
-    from jinja2 import Template
-except ImportError as e:
-    raise ImportError("Jinja2 is required. Please install it with: pip install jinja2") from e
-
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
@@ -21,43 +16,27 @@ except ImportError as e:
 # Import tool sandbox functionality
 from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
 
-# Jinja2 template for tool-enabled conversations
-TOOL_TEMPLATE = """<|im_start|>system
-{%- if messages[0]['role'] == 'system' %}
-{{- messages[0]['content'] }}
-{%- else %}
-You are a helpful assistant.
-{%- endif %}
-{%- if tools %}
-# Tools
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant that can use Python "
+    "tools to solve mathematical problems. When you need "
+    "to perform calculations, use the code_interpreter "
+    "tool to execute code and get results."
+)
+
+TOOL_SYSTEM_PROMPT = """# Tools
 
 You may call one function at a time to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{%- for tool in tools %}
-{{- tool | tojson }}
-{%- endfor %}
+{tools}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
 After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>
-{%- endif %}
-<|im_end|>
-{%- for message in messages %}
-{%- if message['role'] == 'user' %}
-<|im_start|>user
-{{- message['content'] }}<|im_end|>
-{%- elif message['role'] == 'assistant' %}
-<|im_start|>assistant
-{{- message['content'] }}<|im_end|>
-{%- endif %}
-{%- endfor %}
-<|im_start|>assistant
-"""
+</tool_call>"""
 
 
 def format_conversation_with_tools(
@@ -66,8 +45,7 @@ def format_conversation_with_tools(
     system_prompt: str = None,
     messages: list[dict[str, Any]] = None,
 ) -> str:
-    """Format conversation using Jinja2 template with tool support"""
-    template = Template(TOOL_TEMPLATE)
+    """Format conversation using a static system prompt and explicit message rendering."""
 
     # Prepare messages
     messages_to_render = []
@@ -76,12 +54,11 @@ def format_conversation_with_tools(
     if system_prompt:
         system_content = system_prompt
     else:
-        system_content = (
-            "You are a helpful assistant that can use Python "
-            "tools to solve mathematical problems. When you need "
-            "to perform calculations, use the code_interpreter "
-            "tool to execute code and get results."
-        )
+        system_content = DEFAULT_SYSTEM_PROMPT
+
+    if tools:
+        tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tools)
+        system_content = f"{system_content}\n\n{TOOL_SYSTEM_PROMPT.format(tools=tool_lines)}"
 
     messages_to_render.append({"role": "system", "content": system_content})
 
@@ -91,12 +68,37 @@ def format_conversation_with_tools(
 
     # Add assistant responses from previous turns if provided
     if messages:
-        messages_to_render.extend(messages)
+        messages_to_render.extend(
+            message
+            for message in messages
+            if _should_keep_message(message)
+        )
 
-    # Render template
-    formatted_text = template.render(messages=messages_to_render, tools=tools or [])
+    rendered_parts = []
+    for message in messages_to_render:
+        role = message["role"]
+        if role == "system":
+            rendered_parts.append(f"<|im_start|>system\n{message['content']}<|im_end|>")
+        elif role == "user":
+            rendered_parts.append(f"<|im_start|>user\n{message['content']}<|im_end|>")
+        elif role == "assistant":
+            assistant_text = ["<|im_start|>assistant", message.get("content", "")]
+            for tool_call in message.get("tool_calls", []):
+                assistant_text.append("<tool_call>")
+                assistant_text.append(json.dumps(tool_call["function"], ensure_ascii=False))
+                assistant_text.append("</tool_call>")
+            assistant_text.append("<|im_end|>")
+            rendered_parts.append("\n".join(part for part in assistant_text if part != ""))
+        elif role == "tool":
+            rendered_parts.append(
+                "<|im_start|>user\n"
+                "<tool_response>\n"
+                f"{message['content']}\n"
+                "</tool_response><|im_end|>"
+            )
 
-    return formatted_text
+    rendered_parts.append("<|im_start|>assistant")
+    return "\n".join(rendered_parts)
 
 
 def _stringify_message_content(content: Any) -> str:
@@ -123,6 +125,84 @@ def _stringify_message_content(content: Any) -> str:
     return str(content)
 
 
+def _has_message_content(content: Any) -> bool:
+    """Return whether a message content should be kept in the rendered chat."""
+    if isinstance(content, str):
+        return bool(content.strip())
+    return bool(_stringify_message_content(content).strip())
+
+
+def _should_keep_message(message: Any) -> bool:
+    """Return whether a structured message should be kept in the chat history."""
+    if not isinstance(message, dict):
+        return False
+    if message.get("tool_calls"):
+        return True
+    return _has_message_content(message.get("content", ""))
+
+
+def _extract_first_tool_call(prediction: str) -> dict[str, Any] | None:
+    """Extract the first tool call from a model response."""
+    tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
+    if not tool_call_match:
+        return None
+
+    try:
+        json_str = tool_call_match.group(1).replace("\n", "\\n")
+        tool_call_data = json.loads(json_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+    if not isinstance(tool_call_data, dict):
+        return None
+    return tool_call_data
+
+
+def _build_assistant_message(prediction: str) -> dict[str, Any] | None:
+    """Build a structured assistant message from a model response."""
+    sanitized_prediction = postprocess_responses(prediction)
+    tool_call = _extract_first_tool_call(sanitized_prediction)
+    if tool_call is None:
+        content = sanitized_prediction.rstrip()
+        if not content:
+            return None
+        return {"role": "assistant", "content": content}
+
+    tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, sanitized_prediction, re.DOTALL)
+    if tool_call_match is None:
+        return {"role": "assistant", "content": sanitized_prediction.rstrip()}
+
+    content = sanitized_prediction[: tool_call_match.start()].rstrip()
+    return {
+        "role": "assistant",
+        "content": content,
+        "tool_calls": [{"type": "function", "function": tool_call}],
+    }
+
+
+def _render_tool_message(tool_message: dict[str, Any]) -> str:
+    """Render a structured tool message into the rollout transcript format."""
+    return (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<tool_response>\n"
+        f"{tool_message['content']}\n"
+        "</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
+def _build_initial_recorded_messages(
+    prompt: str | list[dict[str, Any]], system_prompt: str = None
+) -> list[dict[str, Any]]:
+    """Build the initial structured message list used for debugging and replay."""
+    recorded_messages = [{"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT}]
+    recorded_messages.extend(_normalize_prompt_messages(prompt))
+    return recorded_messages
+
+
 def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
     """Normalize prompt input into chat messages."""
     if prompt is None:
@@ -131,16 +211,25 @@ def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> lis
         normalized_messages = []
         for message in prompt:
             if not isinstance(message, dict):
-                normalized_messages.append({"role": "user", "content": str(message)})
+                content = str(message)
+                if not content.strip():
+                    continue
+                normalized_messages.append({"role": "user", "content": content})
+                continue
+            content = _stringify_message_content(message.get("content", ""))
+            if not content.strip():
                 continue
             normalized_messages.append(
                 {
                     "role": message.get("role", "user"),
-                    "content": _stringify_message_content(message.get("content", "")),
+                    "content": content,
                 }
             )
         return normalized_messages
-    return [{"role": "user", "content": str(prompt)}]
+    content = str(prompt)
+    if not content.strip():
+        return []
+    return [{"role": "user", "content": content}]
 
 
 def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
@@ -165,27 +254,15 @@ def postprocess_predictions(prediction: str):
         return "answer", content
 
     # Then check for <tool_call> tags (new format from Jinja2 template)
-    tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
-    tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
-    if tool_call_match:
-        try:
-            import json
+    tool_call_data = _extract_first_tool_call(prediction)
+    if tool_call_data:
+        tool_name = tool_call_data.get("name")
+        arguments = tool_call_data.get("arguments", {})
 
-            # Clean up the JSON string by removing newlines and extra
-            # whitespace
-            json_str = tool_call_match.group(1)
-            # Replace newlines in string values with \n
-            json_str = json_str.replace("\n", "\\n")
-            tool_call_data = json.loads(json_str)
-            tool_name = tool_call_data.get("name")
-            arguments = tool_call_data.get("arguments", {})
-
-            if tool_name == "code_interpreter":
-                code = arguments.get("code", "")
-                if code.strip():
-                    return "code", code
-        except (json.JSONDecodeError, KeyError, AttributeError):
-            pass
+        if tool_name == "code_interpreter":
+            code = arguments.get("code", "")
+            if code.strip():
+                return "code", code
 
     # Then check for <code> tags
     code_pattern = r"<code>(.*?)</code>"
@@ -239,7 +316,9 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
-async def execute_predictions(prediction: str, tool_registry: ToolRegistry) -> str:
+async def execute_predictions(
+    prediction: str, tool_registry: ToolRegistry
+) -> tuple[str, bool, dict[str, Any] | None]:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
 
@@ -250,42 +329,30 @@ async def execute_predictions(prediction: str, tool_registry: ToolRegistry) -> s
         if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("code_interpreter", {"code": code})
-            next_obs = (
-                "<|im_end|>\n"
-                "<|im_start|>user\n"
-                "<tool_response>\n"
-                f"{result}\n"
-                "</tool_response><|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
+            tool_message = {"role": "tool", "content": str(result)}
+            next_obs = _render_tool_message(tool_message)
             done = False
         else:
-            next_obs = (
-                "<|im_end|>\n"
-                "<|im_start|>user\n"
-                "<tool_response>\n"
-                "Error: No Python code found\n"
-                "</tool_response><|im_end|>\n"
-                "<|im_start|>assistant\n"
-            )
+            tool_message = {"role": "tool", "content": "Error: No Python code found"}
+            next_obs = _render_tool_message(tool_message)
             done = False
     elif action == "answer":
         next_obs = ""
         done = True
+        tool_message = None
     else:
-        next_obs = (
-            "<|im_end|>\n"
-            "<|im_start|>user\n"
-            "<tool_response>\n"
-            "My previous action is invalid. "
-            "If I want to execute code, I should return a JSON object inside <tool_call></tool_call>. "
-            "If I want to give the final answer, I should use the format 'Answer: \\boxed{answer}'. Let me try again.\n"
-            "</tool_response><|im_end|>\n"
-            "<|im_start|>assistant\n"
-        )
+        tool_message = {
+            "role": "tool",
+            "content": (
+                "My previous action is invalid. "
+                "If I want to execute code, I should return a JSON object inside <tool_call></tool_call>. "
+                "If I want to give the final answer, I should use the format 'Answer: \\boxed{answer}'. Let me try again."
+            ),
+        }
+        next_obs = _render_tool_message(tool_message)
         done = False
 
-    return next_obs, done
+    return next_obs, done, tool_message
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -301,8 +368,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
-
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    recorded_messages = _build_initial_recorded_messages(sample.prompt)
+    interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
         max_context_length = args.rollout_max_context_len
     else:
@@ -315,6 +383,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.loss_mask = []
     sample.sandbox_session_id = sandbox_session_id
     sample.sandbox_backend = sandbox_backend
+    sample.messages = list(recorded_messages)
 
     print(f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} sample_start")
 
@@ -325,15 +394,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     last_finish_reason = None
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
+        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
+        current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
         # Check if total length exceeds max context length
-        total_length = len(prompt_tokens_ids) + len(response_token_ids)
+        total_length = len(current_prompt_token_ids)
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
         remaining_context = max_context_length - total_length
 
         # Use token IDs instead of text
-        current_token_ids = prompt_tokens_ids + response_token_ids
+        current_token_ids = current_prompt_token_ids
         current_sampling_params = dict(sampling_params)
         current_sampling_params["max_new_tokens"] = min(
             current_sampling_params["max_new_tokens"],
@@ -385,9 +457,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
         if "output_token_logprobs" in output["meta_info"]:
-            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            cur_response = state.tokenizer.decode(cur_response_token_ids)
-            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            raw_response = state.tokenizer.decode(raw_response_token_ids)
+            cur_response = postprocess_responses(raw_response)
+            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]][: len(cur_response_token_ids)]
             if sample.rollout_log_probs is None:
                 sample.rollout_log_probs = []
             sample.rollout_log_probs += cur_log_probs
@@ -401,12 +475,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_token_ids += cur_response_token_ids
         loss_masks += [1] * len(cur_response_token_ids)
 
+        assistant_message = _build_assistant_message(cur_response)
+        if assistant_message is not None:
+            interaction_messages.append(assistant_message)
+            recorded_messages.append(assistant_message)
+            sample.messages = list(recorded_messages)
+
         # Check length limit
         if last_finish_reason == "length":
             sample.status = Sample.Status.TRUNCATED
             break
 
-        next_obs, done = await execute_predictions(cur_response, tool_registry)
+        next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
         if done:
             break
 
@@ -417,7 +497,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-        remaining_context = max_context_length - (len(prompt_tokens_ids) + len(response_token_ids))
+        remaining_context = max_context_length - (len(current_prompt_token_ids) + len(cur_response_token_ids))
         if remaining_context <= 0:
             sample.status = Sample.Status.TRUNCATED
             break
@@ -428,6 +508,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response += next_obs
         response_token_ids += obs_tokens_ids
         loss_masks += [0] * len(obs_tokens_ids)
+
+        if tool_message is not None:
+            interaction_messages.append(tool_message)
+            recorded_messages.append(tool_message)
+            sample.messages = list(recorded_messages)
 
         # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
         # Check if maximum tool call count reached
