@@ -208,6 +208,9 @@ def _trim_response_token_prefix(
     raw_token_ids: list[int],
     raw_log_probs: list[float],
     sanitized_response: str,
+    *,
+    sandbox_session_id: str | None = None,
+    turn: int | None = None,
 ) -> tuple[list[int], list[float]]:
     """Trim generated token/logprob sequences to the sanitized response prefix."""
     raw_response = tokenizer.decode(raw_token_ids)
@@ -222,6 +225,15 @@ def _trim_response_token_prefix(
             return raw_token_ids[:prefix_len], raw_log_probs[:prefix_len]
 
     sanitized_token_ids = tokenizer(sanitized_response, add_special_tokens=False)["input_ids"]
+    raw_suffix = raw_response[-200:].replace("\n", "\\n")
+    sanitized_suffix = sanitized_response[-200:].replace("\n", "\\n")
+    print(
+        "[token-trim-mismatch] "
+        f"session={sandbox_session_id} turn={turn} "
+        f"raw_tokens={len(raw_token_ids)} sanitized_tokens={len(sanitized_token_ids)} "
+        f"raw_chars={len(raw_response)} sanitized_chars={len(sanitized_response)} "
+        f"raw_suffix={raw_suffix!r} sanitized_suffix={sanitized_suffix!r}"
+    )
     trimmed_log_probs = raw_log_probs[: len(sanitized_token_ids)]
     if len(trimmed_log_probs) < len(sanitized_token_ids):
         trimmed_log_probs = trimmed_log_probs + [0.0] * (len(sanitized_token_ids) - len(trimmed_log_probs))
@@ -491,6 +503,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 raw_response_token_ids,
                 raw_log_probs,
                 cur_response,
+                sandbox_session_id=sandbox_session_id,
+                turn=turn,
             )
             if sample.rollout_log_probs is None:
                 sample.rollout_log_probs = []
