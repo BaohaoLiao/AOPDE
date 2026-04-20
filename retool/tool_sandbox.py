@@ -109,6 +109,8 @@ class PythonSandbox:
             "statistics",
             "decimal",
             "fractions",
+            "sympy",
+            "numpy"
         }
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
