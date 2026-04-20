@@ -39,7 +39,8 @@ You are provided with function signatures within <tools></tools> XML tags:
 {%- endfor %}
 </tools>
 
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
+After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>
@@ -189,30 +190,40 @@ async def execute_predictions(prediction: str, tool_registry: ToolRegistry) -> s
         # postprocess_predictions)
         code = content.strip()
         if code:
-            effective_code = tool_registry.get_effective_code(code)
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             next_obs = (
-                "\n\n<interpreter>\n"
-                "Executed code:\n"
-                f"```python\n{effective_code}\n```\n\n"
+                "<|im_end|>\n"
+                "<|im_start|>user\n"
+                "<tool_response>\n"
                 f"{result}\n"
-                "</interpreter>\n\n"
+                "</tool_response><|im_end|>\n"
+                "<|im_start|>assistant\n"
             )
             done = False
         else:
-            next_obs = "\n\n<interpreter>\nError: No Python code found" "\n</interpreter>\n\n"
+            next_obs = (
+                "<|im_end|>\n"
+                "<|im_start|>user\n"
+                "<tool_response>\n"
+                "Error: No Python code found\n"
+                "</tool_response><|im_end|>\n"
+                "<|im_start|>assistant\n"
+            )
             done = False
     elif action == "answer":
         next_obs = ""
         done = True
     else:
         next_obs = (
-            "\nMy previous action is invalid. "
-            "If I want to execute code, I should put the code between "
-            "<code> and </code>. "
-            "If I want to give the final answer, I should use the format "
-            "'Answer: \\boxed{answer}'. Let me try again.\n"
+            "<|im_end|>\n"
+            "<|im_start|>user\n"
+            "<tool_response>\n"
+            "My previous action is invalid. "
+            "If I want to execute code, I should return a JSON object inside <tool_call></tool_call>. "
+            "If I want to give the final answer, I should use the format 'Answer: \\boxed{answer}'. Let me try again.\n"
+            "</tool_response><|im_end|>\n"
+            "<|im_start|>assistant\n"
         )
         done = False
 
@@ -285,7 +296,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 # Count available tools (from tool_specs)
                 available_tools = len(tool_specs)
                 # Count tools used in the current response
-                tools_used = response.count("<interpreter>")
+                tools_used = response.count("<tool_response>")
 
                 wandb.log(
                     {
@@ -338,7 +349,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # Count tool calls (when we get interpreter output, it means a tool
         # was called)
-        if "<interpreter>" in next_obs:
+        if "<tool_response>" in next_obs:
             tool_call_count += 1
 
         assert next_obs != "", "Next observation should not be empty."
