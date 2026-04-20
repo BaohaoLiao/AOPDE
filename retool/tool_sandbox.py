@@ -229,12 +229,12 @@ class PythonSandbox:
         if not is_safe:
             return f"Error: {message}"
 
+        previous_code = self._successful_code
         combined_code = self.get_effective_code(code)
 
-        # Add necessary wrapper code with memory limits
-        # Properly indent the user code within the try block
-        # Handle indentation properly by adding 4 spaces to each line
-        indented_code = "\n".join("    " + line for line in combined_code.split("\n"))
+        # Replay prior successful code silently, then run only the new code with captured output.
+        indented_previous_code = "\n".join("    " + line for line in previous_code.split("\n")) if previous_code else ""
+        indented_current_code = "\n".join("    " + line for line in code.split("\n"))
 
         wrapped_code = f"""import sys
 import traceback
@@ -252,12 +252,20 @@ old_stdout = sys.stdout
 old_stderr = sys.stderr
 stdout_capture = StringIO()
 stderr_capture = StringIO()
-sys.stdout = stdout_capture
-sys.stderr = stderr_capture
 
 try:
-    # User code
-{indented_code}
+    if {bool(previous_code)}:
+        silent_stdout = StringIO()
+        silent_stderr = StringIO()
+        sys.stdout = silent_stdout
+        sys.stderr = silent_stderr
+{indented_previous_code if previous_code else '        pass'}
+
+    sys.stdout = stdout_capture
+    sys.stderr = stderr_capture
+
+    # Current user code
+{indented_current_code}
     
     # Get output
     stdout_output = stdout_capture.getvalue()
