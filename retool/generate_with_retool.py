@@ -203,6 +203,31 @@ def _build_initial_recorded_messages(
     return recorded_messages
 
 
+def _trim_response_token_prefix(
+    tokenizer,
+    raw_token_ids: list[int],
+    raw_log_probs: list[float],
+    sanitized_response: str,
+) -> tuple[list[int], list[float]]:
+    """Trim generated token/logprob sequences to the sanitized response prefix."""
+    raw_response = tokenizer.decode(raw_token_ids)
+    if sanitized_response == raw_response:
+        return raw_token_ids, raw_log_probs
+
+    if not sanitized_response:
+        return [], []
+
+    for prefix_len in range(1, len(raw_token_ids) + 1):
+        if tokenizer.decode(raw_token_ids[:prefix_len]) == sanitized_response:
+            return raw_token_ids[:prefix_len], raw_log_probs[:prefix_len]
+
+    sanitized_token_ids = tokenizer(sanitized_response, add_special_tokens=False)["input_ids"]
+    trimmed_log_probs = raw_log_probs[: len(sanitized_token_ids)]
+    if len(trimmed_log_probs) < len(sanitized_token_ids):
+        trimmed_log_probs = trimmed_log_probs + [0.0] * (len(sanitized_token_ids) - len(trimmed_log_probs))
+    return sanitized_token_ids, trimmed_log_probs
+
+
 def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
     """Normalize prompt input into chat messages."""
     if prompt is None:
@@ -458,10 +483,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         if "output_token_logprobs" in output["meta_info"]:
             raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
             raw_response = state.tokenizer.decode(raw_response_token_ids)
             cur_response = postprocess_responses(raw_response)
-            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
-            cur_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]][: len(cur_response_token_ids)]
+            cur_response_token_ids, cur_log_probs = _trim_response_token_prefix(
+                state.tokenizer,
+                raw_response_token_ids,
+                raw_log_probs,
+                cur_response,
+            )
             if sample.rollout_log_probs is None:
                 sample.rollout_log_probs = []
             sample.rollout_log_probs += cur_log_probs
