@@ -29,7 +29,7 @@ except ImportError:
 TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
-    "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
+    "tool_concurrency": int(os.environ.get("TOOL_SANDBOX_CONCURRENCY", "32")),
     "sandbox_backend": os.environ.get("TOOL_SANDBOX_BACKEND", "subprocess").lower(),
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
@@ -487,7 +487,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": {
                     "name": "code_interpreter",
-                    "description": "A tool for executing Python code in a safe sandbox environment.",
+                    "description": "A tool for executing Python code in a stateful Jupyter notebook. Use print() to see output.",
                     "parameters": {
                         "type": "object",
                         "properties": {"code": {"type": "string", "description": "The Python code to execute"}},
