@@ -139,6 +139,8 @@ CUSTOM_ARGS=(
 # launch the master node of ray in container
 export CUDA_VISIBLE_DEVICES=6,7
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+export TOOL_SANDBOX_BACKEND=${TOOL_SANDBOX_BACKEND:-"subprocess"}
+export TOOL_SANDBOX_JUPYTER_TIMEOUT=${TOOL_SANDBOX_JUPYTER_TIMEOUT:-"300"}
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 # Build the runtime environment JSON with proper variable substitution
@@ -146,7 +148,9 @@ RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${MEGATRON_ROOT}:${SCRIPT_DIR}:${SLIME_ROOT}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
-    \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\"
+      "NCCL_NVLS_ENABLE": "${HAS_NVLINK}",
+      "TOOL_SANDBOX_BACKEND": "${TOOL_SANDBOX_BACKEND}",
+      "TOOL_SANDBOX_JUPYTER_TIMEOUT": "${TOOL_SANDBOX_JUPYTER_TIMEOUT}"
   }
 }"
 

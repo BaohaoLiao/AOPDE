@@ -237,6 +237,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     state = GenerateState(args)
     tool_registry = ToolRegistry()
     sandbox_session_id = tool_registry.session_id
+    sandbox_backend = tool_registry.backend
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
@@ -255,8 +256,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response_length = 0
     sample.loss_mask = []
     sample.sandbox_session_id = sandbox_session_id
+    sample.sandbox_backend = sandbox_backend
 
-    print(f"[sandbox] session={sandbox_session_id} sample_start")
+    print(f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} sample_start")
 
     response = ""
     response_token_ids = []
@@ -302,6 +304,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     {
                         "debug/payload_length": len(prompt + response),
                         "debug/available_tools": available_tools,
+                        "debug/sandbox_backend": sandbox_backend,
                         "debug/sandbox_session_id": sandbox_session_id,
                         "debug/tools_used": tools_used,
                         "debug/turn": turn,
@@ -310,7 +313,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         except ImportError:
             pass  # wandb not available
 
-        print(f"[sandbox] session={sandbox_session_id} turn={turn} tool_calls={tool_call_count}")
+        print(
+            f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
+        )
 
         output = await post(url, payload)
 
@@ -392,6 +397,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.payload_has_system = "<|im_start|>system" in prompt + response
     sample.payload_has_tools = "# Tools" in prompt + response
     sample.sandbox_session_id = sandbox_session_id
+    sample.sandbox_backend = sandbox_backend
 
     # Store tool call count for reward calculation
     sample.tool_call_count = tool_call_count
@@ -406,6 +412,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             case "stop":
                 sample.status = Sample.Status.COMPLETED
 
+    await tool_registry.close()
     return sample
 
 

@@ -20,13 +20,20 @@ from typing import Any
 
 import psutil
 
+try:
+    from jupyter_client import AsyncKernelManager
+except ImportError:
+    AsyncKernelManager = None
+
 # Configuration for tool execution
 TOOL_CONFIGS = {
     "max_turns": 16,
     "max_tool_calls": 16,
     "tool_concurrency": 32,  # Aggressive: 32 concurrent processes
+    "sandbox_backend": os.environ.get("TOOL_SANDBOX_BACKEND", "subprocess").lower(),
     # Python interpreter settings
     "python_timeout": 120,  # 2 minutes for complex calculations
+    "jupyter_timeout": int(os.environ.get("TOOL_SANDBOX_JUPYTER_TIMEOUT", "300")),
     "python_memory_limit": "4GB",  # 4GB per Python process
     "python_cpu_limit": 1,
     # Memory management settings
@@ -179,6 +186,10 @@ class PythonSandbox:
         """Get the code that will actually be executed in the sandbox."""
         return code if not self._successful_code else f"{self._successful_code}\n\n{code}"
 
+    async def close(self):
+        """Close sandbox resources."""
+        return None
+
     @contextmanager
     def _create_safe_environment(self):
         """Create safe execution environment with temporary directory"""
@@ -318,15 +329,153 @@ except Exception as e:
             return result
 
 
+class JupyterPythonSandbox(PythonSandbox):
+    """Stateful Python sandbox backed by a dedicated Jupyter kernel."""
+
+    def __init__(self, timeout: int = 300, memory_limit: str = "100MB"):
+        super().__init__(timeout=timeout, memory_limit=memory_limit)
+        self._kernel_manager = None
+        self._kernel_client = None
+        self._kernel_lock = asyncio.Lock()
+        self._temp_dir = None
+
+    def get_effective_code(self, code: str) -> str:
+        """Jupyter executes only the current cell against persistent kernel state."""
+        return code
+
+    async def _ensure_kernel(self):
+        if self._kernel_client is not None:
+            return
+        if AsyncKernelManager is None:
+            raise RuntimeError("jupyter_client is required for TOOL_SANDBOX_BACKEND=jupyter")
+
+        self._temp_dir = tempfile.mkdtemp(prefix="python_jupyter_sandbox_")
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+
+        self._kernel_manager = AsyncKernelManager(kernel_name="python3")
+        await self._kernel_manager.start_kernel(cwd=self._temp_dir, env=env)
+        self._kernel_client = self._kernel_manager.client()
+        self._kernel_client.start_channels()
+        await self._kernel_client.wait_for_ready(timeout=self.timeout)
+
+    @staticmethod
+    def _format_rich_output(content: dict[str, Any]) -> str:
+        data = content.get("data", {})
+        if "text/plain" in data:
+            text = data["text/plain"]
+            return text if isinstance(text, str) else "".join(text)
+        return ""
+
+    async def execute_code(self, code: str) -> str:
+        current_memory = get_memory_usage()
+        if current_memory > TOOL_CONFIGS["max_memory_usage"]:
+            aggressive_cleanup_memory()
+            return "Error: Memory usage too high, please try again"
+
+        is_safe, message = self._check_code_safety(code)
+        if not is_safe:
+            return f"Error: {message}"
+
+        async with self._kernel_lock:
+            try:
+                await self._ensure_kernel()
+            except Exception as exc:
+                return f"Error: Failed to start Jupyter kernel: {exc}"
+
+            stdout_parts = []
+            stderr_parts = []
+            rich_output_parts = []
+            error_output = None
+
+            msg_id = self._kernel_client.execute(code, stop_on_error=True)
+
+            try:
+                while True:
+                    msg = await asyncio.wait_for(self._kernel_client.get_iopub_msg(), timeout=self.timeout)
+                    if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                        continue
+
+                    msg_type = msg.get("msg_type")
+                    content = msg.get("content", {})
+                    if msg_type == "stream":
+                        if content.get("name") == "stderr":
+                            stderr_parts.append(content.get("text", ""))
+                        else:
+                            stdout_parts.append(content.get("text", ""))
+                    elif msg_type in {"display_data", "execute_result"}:
+                        formatted = self._format_rich_output(content)
+                        if formatted:
+                            rich_output_parts.append(formatted)
+                    elif msg_type == "error":
+                        traceback_text = "\n".join(content.get("traceback", []))
+                        error_output = f"Error: {content.get('evalue', '')}\nTraceback:\n{traceback_text}"
+                    elif msg_type == "status" and content.get("execution_state") == "idle":
+                        break
+            except asyncio.TimeoutError:
+                await self._kernel_manager.interrupt_kernel()
+                return f"Error: Code execution timed out after {self.timeout} seconds"
+
+            cleanup_message = check_and_cleanup_memory()
+            if cleanup_message:
+                stderr_parts.append(f"Memory cleanup: {cleanup_message}\n")
+
+            if error_output is not None:
+                return error_output
+
+            result = ""
+            stdout_output = "".join(stdout_parts)
+            stderr_output = "".join(stderr_parts)
+            rich_output = "\n".join(part for part in rich_output_parts if part)
+
+            if stdout_output:
+                result += f"Output:\n{stdout_output}"
+            if rich_output:
+                if result:
+                    result += "\n"
+                result += f"Output:\n{rich_output}"
+            if stderr_output:
+                if result:
+                    result += "\n"
+                result += f"Errors:\n{stderr_output}"
+
+            return result.strip()
+
+    async def close(self):
+        async with self._kernel_lock:
+            if self._kernel_client is not None:
+                self._kernel_client.stop_channels()
+                self._kernel_client = None
+            if self._kernel_manager is not None:
+                await self._kernel_manager.shutdown_kernel(now=True)
+                self._kernel_manager = None
+            if self._temp_dir is not None:
+                try:
+                    import shutil
+
+                    shutil.rmtree(self._temp_dir)
+                except Exception:
+                    pass
+                self._temp_dir = None
+
+
 class ToolRegistry:
     """Tool registry, manages available tools and their execution"""
 
-    def __init__(self):
+    def __init__(self, backend: str | None = None):
         self.tools = {}
         self.session_id = uuid.uuid4().hex[:8]
-        self.python_sandbox = PythonSandbox(
-            timeout=TOOL_CONFIGS["python_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
-        )
+        self.backend = (backend or TOOL_CONFIGS["sandbox_backend"]).lower()
+        if self.backend == "jupyter":
+            self.python_sandbox = JupyterPythonSandbox(
+                timeout=TOOL_CONFIGS["jupyter_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
+            )
+        elif self.backend == "subprocess":
+            self.python_sandbox = PythonSandbox(
+                timeout=TOOL_CONFIGS["python_timeout"], memory_limit=TOOL_CONFIGS["python_memory_limit"]
+            )
+        else:
+            raise ValueError(f"Unsupported sandbox backend: {self.backend}")
         self._register_default_tools()
 
     def _register_default_tools(self):
@@ -359,6 +508,10 @@ class ToolRegistry:
     def get_effective_code(self, code: str) -> str:
         """Get the effective Python code after attaching prior successful state."""
         return self.python_sandbox.get_effective_code(code)
+
+    async def close(self):
+        """Close sandbox resources associated with this registry."""
+        await self.python_sandbox.close()
 
     async def execute_tool(self, tool_name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool call with the given arguments"""
