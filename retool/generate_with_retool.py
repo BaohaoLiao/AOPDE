@@ -1,4 +1,5 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import json
 import re
 from typing import Any
 
@@ -30,7 +31,7 @@ You are a helpful assistant.
 {%- if tools %}
 # Tools
 
-You may call one or more functions to assist with the user query.
+You may call one function at a time to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
@@ -60,7 +61,10 @@ After a tool is executed, you will receive the tool result in a user message wra
 
 
 def format_conversation_with_tools(
-    prompt: str, tools: list[dict[str, Any]] = None, system_prompt: str = None, messages: list[dict[str, Any]] = None
+    prompt: str | list[dict[str, Any]],
+    tools: list[dict[str, Any]] = None,
+    system_prompt: str = None,
+    messages: list[dict[str, Any]] = None,
 ) -> str:
     """Format conversation using Jinja2 template with tool support"""
     template = Template(TOOL_TEMPLATE)
@@ -81,9 +85,9 @@ def format_conversation_with_tools(
 
     messages_to_render.append({"role": "system", "content": system_content})
 
-    # Add user message if provided
-    if prompt:
-        messages_to_render.append({"role": "user", "content": prompt})
+    prompt_messages = _normalize_prompt_messages(prompt)
+    if prompt_messages:
+        messages_to_render.extend(prompt_messages)
 
     # Add assistant responses from previous turns if provided
     if messages:
@@ -93,6 +97,61 @@ def format_conversation_with_tools(
     formatted_text = template.render(messages=messages_to_render, tools=tools or [])
 
     return formatted_text
+
+
+def _stringify_message_content(content: Any) -> str:
+    """Convert structured message content into plain text for prompting and rewards."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif "content" in item:
+                    parts.append(_stringify_message_content(item.get("content")))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        if "content" in content:
+            return _stringify_message_content(content.get("content"))
+        return json.dumps(content, ensure_ascii=False)
+    return str(content)
+
+
+def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    """Normalize prompt input into chat messages."""
+    if prompt is None:
+        return []
+    if isinstance(prompt, list):
+        normalized_messages = []
+        for message in prompt:
+            if not isinstance(message, dict):
+                normalized_messages.append({"role": "user", "content": str(message)})
+                continue
+            normalized_messages.append(
+                {
+                    "role": message.get("role", "user"),
+                    "content": _stringify_message_content(message.get("content", "")),
+                }
+            )
+        return normalized_messages
+    return [{"role": "user", "content": str(prompt)}]
+
+
+def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
+    """Convert prompt data into a string for reward computation."""
+    if isinstance(prompt, str):
+        return prompt
+    normalized_messages = _normalize_prompt_messages(prompt)
+    lines = []
+    for message in normalized_messages:
+        lines.append(f"{message['role']}: {message['content']}")
+    return "\n".join(lines)
 
 
 def postprocess_predictions(prediction: str):
@@ -149,12 +208,11 @@ def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
-        # Find the last occurrence of <tool_call>...</tool_call>
+        # Keep only the first complete <tool_call>...</tool_call> block.
         tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
-        matches = list(re.finditer(tool_call_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
+        match = re.search(tool_call_pattern, resp, re.DOTALL)
+        if match:
+            return resp[: match.end()]
 
     # Handle <code> tags
     if "</code>" in resp:
@@ -422,7 +480,7 @@ async def reward_func(args, sample, **kwargs):
         raise TypeError("Sample must be an instance of Sample class.")
 
     # Build complete solution string
-    solution_str = sample.prompt + sample.response
+    solution_str = _prompt_to_text(sample.prompt) + sample.response
 
     # Get ground truth answer - label is a string, not a dict
     ground_truth = sample.label if sample.label is not None else ""
