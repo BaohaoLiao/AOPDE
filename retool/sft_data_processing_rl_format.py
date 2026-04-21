@@ -15,6 +15,12 @@ DEFAULT_SYSTEM_PROMPT = (
     "tool to execute code and get results."
 )
 
+USER_PROMPT_TEMPLATE = """Solve the following math problem step by step. The last line of your response should be of the form Answer: \\boxed{{$Answer}} where $Answer is the answer to the problem.
+
+{question}
+
+Remember to put your answer on its own line after \"Answer:\"."""
+
 CODE_INTERPRETER_TOOL = {
     "type": "function",
     "function": {
@@ -146,19 +152,23 @@ def keep_first_tool_call(text: str) -> str:
     return assistant_content_from_tool_call(normalized_tool_call, prefix=prefix)
 
 
-def build_assistant_message(content: str = "", tool_call: dict[str, Any] | None = None) -> dict[str, str] | None:
+def build_assistant_message(content: str = "", tool_call: dict[str, Any] | None = None) -> dict[str, Any] | None:
     text = content.rstrip()
     if tool_call is not None:
-        return {"role": "assistant", "content": assistant_content_from_tool_call(tool_call, prefix=text)}
+        return {
+            "role": "assistant",
+            "content": text,
+            "tool_calls": [{"type": "function", "function": tool_call}],
+        }
     if not text:
         return None
     return {"role": "assistant", "content": text}
 
 
-def split_assistant_message(message: dict[str, Any]) -> list[dict[str, str]]:
+def split_assistant_message(message: dict[str, Any]) -> list[dict[str, Any]]:
     content = stringify_content(message.get("content", ""))
     tool_calls = message.get("tool_calls") or message.get("function_call")
-    converted_messages: list[dict[str, str]] = []
+    converted_messages: list[dict[str, Any]] = []
 
     if isinstance(tool_calls, list) and tool_calls:
         first_tool_call = normalize_tool_call(tool_calls[0])
@@ -216,19 +226,31 @@ def split_assistant_message(message: dict[str, Any]) -> list[dict[str, str]]:
                 converted_messages.append(assistant_message)
             tool_response = next_match.group(1).strip()
             if tool_response:
-                converted_messages.append({"role": "user", "content": wrap_tool_response(tool_response)})
+                converted_messages.append({"role": "tool", "content": tool_response})
 
         position = next_match.end()
 
     return converted_messages
 
 
-def wrap_tool_response(content: str) -> str:
-    return f"<tool_response>\n{content.strip()}\n</tool_response>"
+def rewrite_user_prompt(content: str) -> str:
+    question = content.strip()
+    marker = "*user question:*"
+    if marker in content:
+        question = content.split(marker, 1)[1].strip()
+    question = re.sub(
+        r"Remember to place the final answer in the last part using the format:.*$",
+        "",
+        question,
+        flags=re.DOTALL,
+    ).strip()
+    question = re.sub(r"<answer>\s*\\boxed\{\{'The final answer goes here\.'\}\}\s*</answer>", "", question)
+    question = question.strip()
+    return USER_PROMPT_TEMPLATE.format(question=question)
 
 
-def convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
-    converted = [{"role": "system", "content": build_system_prompt()}]
+def convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    converted: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt()}]
 
     for message in messages:
         if not isinstance(message, dict):
@@ -242,14 +264,14 @@ def convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
             continue
         if role == "user":
             if has_content(content):
-                converted.append({"role": "user", "content": content.strip()})
+                converted.append({"role": "user", "content": rewrite_user_prompt(content)})
             continue
         if role == "assistant":
             converted.extend(split_assistant_message(message))
             continue
         if role in {"tool", "function", "observation"}:
             if has_content(content):
-                converted.append({"role": "user", "content": wrap_tool_response(content)})
+                converted.append({"role": "tool", "content": content.strip()})
             continue
 
         if has_content(content):
