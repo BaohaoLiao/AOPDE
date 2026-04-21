@@ -304,10 +304,31 @@ def convert_sample(sample: dict[str, Any]) -> dict[str, Any]:
     return {"messages": convert_messages(raw_messages)}
 
 
+def count_message_tokens(messages: list[dict[str, Any]], tokenizer: Any) -> int:
+    token_ids = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False,
+        return_dict=False,
+    )
+    return len(token_ids)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Convert JoeYing/ReTool-SFT to local RL-style SFT messages.")
     parser.add_argument("--dataset", default="JoeYing/ReTool-SFT", help="Hugging Face dataset name or local path")
     parser.add_argument("--split", default="train", help="Dataset split to convert")
+    parser.add_argument(
+        "--max-length",
+        type=int,
+        default=None,
+        help="Drop reformatted samples whose tokenized chat length exceeds this limit.",
+    )
+    parser.add_argument(
+        "--tokenizer-model",
+        default="Qwen/Qwen3-4B-Instruct-2507",
+        help="Tokenizer model/path used for max-length filtering.",
+    )
     parser.add_argument(
         "--output",
         default="./data/retool/ReTool-SFT-rl-format.parquet",
@@ -319,7 +340,28 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     dataset = load_dataset(args.dataset)[args.split]
-    converted = dataset.map(convert_sample, remove_columns=dataset.column_names)
+    tokenizer = None
+    if args.max_length is not None:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_model, trust_remote_code=True)
+
+    def convert_and_measure(sample: dict[str, Any]) -> dict[str, Any]:
+        converted_sample = convert_sample(sample)
+        if tokenizer is not None:
+            converted_sample["token_length"] = count_message_tokens(converted_sample["messages"], tokenizer)
+        return converted_sample
+
+    converted = dataset.map(convert_and_measure, remove_columns=dataset.column_names)
+    if args.max_length is not None:
+        original_count = len(converted)
+        converted = converted.filter(lambda sample: sample["token_length"] <= args.max_length)
+        removed_count = original_count - len(converted)
+        converted = converted.remove_columns(["token_length"])
+        print(
+            f"Filtered {removed_count} overlong rows with token_length > {args.max_length} "
+            f"using tokenizer {args.tokenizer_model}"
+        )
     converted.to_parquet(args.output)
     print(f"Saved {len(converted)} rows to {args.output}")
 
