@@ -222,12 +222,12 @@ class PythonSandbox:
         current_memory = get_memory_usage()
         if current_memory > TOOL_CONFIGS["max_memory_usage"]:
             aggressive_cleanup_memory()
-            return "Error: Memory usage too high, please try again"
+            return "Memory usage too high, please try again"
 
         # Check code safety
         is_safe, message = self._check_code_safety(code)
         if not is_safe:
-            return f"Error: {message}"
+            return message
 
         previous_code = self._successful_code
         combined_code = self.get_effective_code(code)
@@ -278,9 +278,11 @@ try:
     # Return result
     result = ""
     if stdout_output:
-        result += f"Output:\\n{{stdout_output}}"
+          result += stdout_output
     if stderr_output:
-        result += f"\\nErrors:\\n{{stderr_output}}"
+          if result and not result.endswith("\\n"):
+                result += "\\n"
+          result += stderr_output
     
     print(result)
     
@@ -290,7 +292,7 @@ except Exception as e:
     sys.stderr = old_stderr
     
     # Return error information
-    error_msg = f"Error: {{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
+     error_msg = f"{{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
     print(error_msg)
     sys.exit(1)"""
 
@@ -318,16 +320,16 @@ except Exception as e:
                         result = stdout.strip()
                         self._successful_code = combined_code
                     else:
-                        result = f"Error: Process exited with code {process.returncode}\n{stderr}"
+                        result = f"Process exited with code {process.returncode}\n{stderr}"
                         if stdout.strip():
                             result = stdout.strip()
 
                 except subprocess.TimeoutExpired:
                     process.kill()
-                    result = f"Error: Code execution timed out after {self.timeout} seconds"
+                    result = f"Code execution timed out after {self.timeout} seconds"
 
             except Exception as e:
-                result = f"Error: Failed to execute code: {str(e)}"
+                result = f"Failed to execute code: {str(e)}"
 
             # Check memory usage after execution and cleanup if needed
             cleanup_message = check_and_cleanup_memory()
@@ -379,17 +381,17 @@ class JupyterPythonSandbox(PythonSandbox):
         current_memory = get_memory_usage()
         if current_memory > TOOL_CONFIGS["max_memory_usage"]:
             aggressive_cleanup_memory()
-            return "Error: Memory usage too high, please try again"
+            return "Memory usage too high, please try again"
 
         is_safe, message = self._check_code_safety(code)
         if not is_safe:
-            return f"Error: {message}"
+            return message
 
         async with self._kernel_lock:
             try:
                 await self._ensure_kernel()
             except Exception as exc:
-                return f"Error: Failed to start Jupyter kernel: {exc}"
+                return f"Failed to start Jupyter kernel: {exc}"
 
             stdout_parts = []
             stderr_parts = []
@@ -417,12 +419,12 @@ class JupyterPythonSandbox(PythonSandbox):
                             rich_output_parts.append(formatted)
                     elif msg_type == "error":
                         traceback_text = "\n".join(content.get("traceback", []))
-                        error_output = f"Error: {content.get('evalue', '')}\nTraceback:\n{traceback_text}"
+                        error_output = f"{content.get('evalue', '')}\nTraceback:\n{traceback_text}"
                     elif msg_type == "status" and content.get("execution_state") == "idle":
                         break
             except asyncio.TimeoutError:
                 await self._kernel_manager.interrupt_kernel()
-                return f"Error: Code execution timed out after {self.timeout} seconds"
+                return f"Code execution timed out after {self.timeout} seconds"
 
             cleanup_message = check_and_cleanup_memory()
             if cleanup_message:
@@ -437,15 +439,15 @@ class JupyterPythonSandbox(PythonSandbox):
             rich_output = "\n".join(part for part in rich_output_parts if part)
 
             if stdout_output:
-                result += f"Output:\n{stdout_output}"
+                result += stdout_output
             if rich_output:
                 if result:
                     result += "\n"
-                result += f"Output:\n{rich_output}"
+                result += rich_output
             if stderr_output:
                 if result:
                     result += "\n"
-                result += f"Errors:\n{stderr_output}"
+                result += stderr_output
 
             return result.strip()
 
