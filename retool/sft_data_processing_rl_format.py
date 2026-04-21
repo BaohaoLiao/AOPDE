@@ -152,8 +152,27 @@ def keep_first_tool_call(text: str) -> str:
     return assistant_content_from_tool_call(normalized_tool_call, prefix=prefix)
 
 
+def normalize_final_answer(text: str) -> str:
+    stripped = text.rstrip()
+    answer_tag_match = re.search(r"<answer>\s*(.*?)\s*</answer>\s*$", stripped, re.DOTALL)
+    if not answer_tag_match:
+        return stripped
+
+    answer_body = answer_tag_match.group(1).strip()
+    boxed_match = re.search(r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}", answer_body, re.DOTALL)
+    if boxed_match:
+        replacement = f"Answer: \\boxed{{{boxed_match.group(1).strip()}}}"
+    else:
+        replacement = f"Answer: {answer_body}"
+
+    prefix = stripped[: answer_tag_match.start()].rstrip()
+    if prefix:
+        return f"{prefix}\n\n{replacement}"
+    return replacement
+
+
 def build_assistant_message(content: str = "", tool_call: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    text = content.rstrip()
+    text = normalize_final_answer(content)
     if tool_call is not None:
         return {
             "role": "assistant",
