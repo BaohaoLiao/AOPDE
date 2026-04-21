@@ -244,6 +244,10 @@ def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> lis
     """Normalize prompt input into chat messages."""
     if prompt is None:
         return []
+    if isinstance(prompt, str) and "<|im_start|>" in prompt:
+        parsed_messages = _parse_chat_transcript(prompt)
+        if parsed_messages:
+            return parsed_messages
     if isinstance(prompt, list):
         normalized_messages = []
         for message in prompt:
@@ -267,6 +271,23 @@ def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> lis
     if not content.strip():
         return []
     return [{"role": "user", "content": content}]
+
+
+def _parse_chat_transcript(prompt: str) -> list[dict[str, str]]:
+    """Parse a rendered chat transcript back into structured messages."""
+    pattern = re.compile(r"<\|im_start\|>(system|user|assistant)\n?(.*?)(?=<\|im_end\|>)<\|im_end\|>", re.DOTALL)
+    messages: list[dict[str, str]] = []
+
+    for role, content in pattern.findall(prompt):
+        text = content.strip()
+        if role == "assistant" and not text:
+            # Ignore generation prompts like <|im_start|>assistant\n with no content.
+            continue
+        if not text:
+            continue
+        messages.append({"role": role, "content": text})
+
+    return messages
 
 
 def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
@@ -541,12 +562,14 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-        remaining_context = max_context_length - (len(current_prompt_token_ids) + len(cur_response_token_ids))
-        if remaining_context <= 0:
+        remaining_observation_tokens = max_context_length - (
+            len(current_prompt_token_ids) + len(cur_response_token_ids)
+        )
+        if remaining_observation_tokens <= 0:
             sample.status = Sample.Status.TRUNCATED
             break
-        if len(obs_tokens_ids) > remaining_context:
-            obs_tokens_ids = obs_tokens_ids[:remaining_context]
+        if len(obs_tokens_ids) > remaining_observation_tokens:
+            obs_tokens_ids = obs_tokens_ids[-remaining_observation_tokens:]
             next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
             sample.status = Sample.Status.TRUNCATED
         response += next_obs
