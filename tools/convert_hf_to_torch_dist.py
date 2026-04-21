@@ -38,6 +38,21 @@ def get_args():
     args = parse_args(add_convertion_args)
     args = set_default_megatron_args(args)
 
+    required_model_args = [
+        "num_layers",
+        "hidden_size",
+        "ffn_hidden_size",
+        "num_attention_heads",
+    ]
+    missing_model_args = [name for name in required_model_args if getattr(args, name, None) is None]
+    if missing_model_args:
+        raise ValueError(
+            "Missing required model architecture arguments: "
+            f"{', '.join(missing_model_args)}. "
+            "Make sure you sourced the correct model args file, for example "
+            "`source scripts/models/qwen3-4B.sh`, and that `${MODEL_ARGS[@]}` is expanding in your current shell."
+        )
+
     # set to pass megatron validate_args
     args.save_interval = 1
     args.micro_batch_size = 1
