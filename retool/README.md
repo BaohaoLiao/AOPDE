@@ -37,7 +37,11 @@ hf download font-info/qwen3-4b-sft-SGLang-RL --local-dir /root/font-info/qwen3-4
 For SFT 
 ```bash
 source scripts/models/qwen3-4B.sh
-PYTHONPATH=/opt/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+export MEGATRON_ROOT=${MEGATRON_ROOT:-/path/to/Megatron-LM}
+export SLIME_ROOT=${SLIME_ROOT:-$PWD/third_party/slime}
+export PYTHONPATH="${MEGATRON_ROOT}:$PWD:${SLIME_ROOT}:${PYTHONPATH}"
+
+python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
     --hf-checkpoint /root/Qwen/Qwen3-4B-Instruct-2507 \
     --rotary-base 5000000 \
@@ -47,7 +51,11 @@ PYTHONPATH=/opt/Megatron-LM python tools/convert_hf_to_torch_dist.py \
 Or RL only
 ```bash
 source scripts/models/qwen3-4B.sh
-PYTHONPATH=/opt/Megatron-LM python tools/convert_hf_to_torch_dist.py \
+export MEGATRON_ROOT=${MEGATRON_ROOT:-/path/to/Megatron-LM}
+export SLIME_ROOT=${SLIME_ROOT:-$PWD/third_party/slime}
+export PYTHONPATH="${MEGATRON_ROOT}:$PWD:${SLIME_ROOT}:${PYTHONPATH}"
+
+python tools/convert_hf_to_torch_dist.py \
     ${MODEL_ARGS[@]} \
     --hf-checkpoint /root/font-info/qwen3-4b-sft \
     --rotary-base 5000000 \
