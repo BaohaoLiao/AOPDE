@@ -62,7 +62,7 @@ INTERPRETER_PATTERN = re.compile(r"<interpreter>\s*(.*?)\s*</interpreter>", re.D
 
 def build_system_prompt() -> str:
     tool_lines = json.dumps(CODE_INTERPRETER_TOOL, ensure_ascii=False)
-    return f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+    return f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}".strip()
 
 
 def stringify_content(content: Any) -> str:
@@ -153,7 +153,7 @@ def keep_first_tool_call(text: str) -> str:
 
 
 def normalize_final_answer(text: str) -> str:
-    stripped = text.rstrip()
+    stripped = text.strip()
     answer_tag_match = re.search(r"<answer>\s*(.*?)\s*</answer>\s*$", stripped, re.DOTALL)
     if not answer_tag_match:
         return stripped
@@ -172,7 +172,7 @@ def normalize_final_answer(text: str) -> str:
 
 
 def build_assistant_message(content: str = "", tool_call: dict[str, Any] | None = None) -> dict[str, Any] | None:
-    text = normalize_final_answer(content)
+    text = normalize_final_answer(content).strip()
     if tool_call is not None:
         return {
             "role": "assistant",
@@ -265,11 +265,11 @@ def rewrite_user_prompt(content: str) -> str:
     ).strip()
     question = re.sub(r"<answer>\s*\\boxed\{\{'The final answer goes here\.'\}\}\s*</answer>", "", question)
     question = question.strip()
-    return USER_PROMPT_TEMPLATE.format(question=question)
+    return USER_PROMPT_TEMPLATE.format(question=question).strip()
 
 
 def convert_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    converted: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt()}]
+    converted: list[dict[str, Any]] = [{"role": "system", "content": build_system_prompt().strip()}]
 
     for message in messages:
         if not isinstance(message, dict):
