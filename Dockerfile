@@ -15,6 +15,9 @@ ARG TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0"
 ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128
 ARG FLASH_ATTN_WHEEL_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.6.8/flash_attn-2.8.3%2Bcu128torch2.9-cp312-cp312-linux_x86_64.whl
 ARG OPENSSL_VERSION=3.6.2
+ARG GO_VERSION=1.26.2
+ARG WANDB_VERSION=v0.26.0
+ARG RUST_VERSION=stable
 
 ENV BASE_DIR=${BASE_DIR} \
     CUDA_HOME=/usr/local/cuda \
@@ -33,6 +36,7 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/u
     apt-get install -y --allow-change-held-packages --no-install-recommends \
       build-essential \
       ca-certificates \
+      cargo \
       cmake \
       curl \
       git \
@@ -44,7 +48,8 @@ RUN sed -i 's|http://archive.ubuntu.com/ubuntu|https://mirrors.edge.kernel.org/u
       ninja-build \
       patch \
       pkg-config \
-      python3-dev && \
+      python3-dev \
+      rustc && \
     rm -rf /var/lib/apt/lists/*
 
 RUN cd /tmp && \
@@ -117,10 +122,23 @@ RUN cd ${BASE_DIR}/slime && \
     rm -rf ${BASE_DIR}/slime/.git
 
 # slime imports wandb from its logging utilities at module import time, including
-# the HF->torch-dist conversion tool. Keep wandb installed so those entrypoints
-# can start even when experiment tracking is disabled. The scanner finding is
-# against the bundled wandb-core binary; PyPI publishes wandb as 0.x releases.
-RUN python -m pip install "wandb==0.26.0"
+# the HF->torch-dist conversion tool. Build wandb from source with a fixed Go
+# toolchain so the bundled wandb-core binary is rebuilt locally.
+RUN cd /tmp && \
+    curl -fsSL -o go.tgz "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go.tgz && \
+    rm -f go.tgz
+RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain ${RUST_VERSION}
+ENV PATH="/root/.cargo/bin:/usr/local/go/bin:${PATH}" \
+    WANDB_BUILD_SKIP_GPU_STATS=1 \
+    WANDB_BUILD_SKIP_ORJSON=1
+RUN python -m pip install build hatchling typing_extensions && \
+    git clone --depth 1 --branch ${WANDB_VERSION} https://github.com/wandb/wandb.git /tmp/wandb-src && \
+    cd /tmp/wandb-src && \
+    python -m build --wheel --no-isolation && \
+    python -m pip install dist/wandb-*.whl && \
+    rm -rf /tmp/wandb-src
 
 RUN python -m pip install nvidia-cudnn-cu12==9.16.0.29 && \
     python -m pip install "numpy<2"
