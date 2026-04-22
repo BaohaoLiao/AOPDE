@@ -102,6 +102,23 @@ def check_and_cleanup_memory():
 class PythonSandbox:
     """Python code sandbox, provides safe code execution environment"""
 
+    DEFAULT_IMPORT_LINES = [
+        "import math",
+        "import random",
+        "import datetime",
+        "import collections",
+        "import itertools",
+        "import functools",
+        "import operator",
+        "import statistics",
+        "import decimal",
+        "import fractions",
+        "import sympy",
+        "from sympy import *",
+        "import numpy",
+        "import numpy as np",
+    ]
+
     def __init__(self, timeout: int = 10, memory_limit: str = "100MB"):
         self.timeout = timeout
         self.memory_limit = memory_limit
@@ -120,6 +137,10 @@ class PythonSandbox:
             "sympy",
             "numpy"
         }
+
+    def _build_default_import_block(self) -> str:
+        """Return the bootstrap imports available to every sandbox execution."""
+        return "\n".join(self.DEFAULT_IMPORT_LINES)
 
     def _check_code_safety(self, code: str) -> tuple[bool, str]:
         """Check code safety by scanning for dangerous patterns"""
@@ -231,6 +252,7 @@ class PythonSandbox:
 
         previous_code = self._successful_code
         combined_code = self.get_effective_code(code)
+        default_import_block = self._build_default_import_block()
 
         # Replay prior successful code silently, then run only the new code with captured output.
         indented_previous_code = "\n".join("    " + line for line in previous_code.split("\n")) if previous_code else ""
@@ -240,6 +262,8 @@ class PythonSandbox:
 import traceback
 from io import StringIO
 import resource
+
+    {default_import_block}
 
 # Set memory limit (4GB)
 try:
@@ -368,6 +392,21 @@ class JupyterPythonSandbox(PythonSandbox):
         self._kernel_client = self._kernel_manager.client()
         self._kernel_client.start_channels()
         await self._kernel_client.wait_for_ready(timeout=self.timeout)
+        bootstrap_code = self._build_default_import_block()
+        msg_id = self._kernel_client.execute(bootstrap_code, stop_on_error=True)
+        while True:
+            msg = await asyncio.wait_for(self._kernel_client.get_iopub_msg(), timeout=self.timeout)
+            if msg.get("parent_header", {}).get("msg_id") != msg_id:
+                continue
+            msg_type = msg.get("msg_type")
+            content = msg.get("content", {})
+            if msg_type == "error":
+                traceback_text = "\n".join(content.get("traceback", []))
+                raise RuntimeError(
+                    f"Failed to initialize default sandbox imports: {content.get('evalue', '')}\n{traceback_text}"
+                )
+            if msg_type == "status" and content.get("execution_state") == "idle":
+                break
 
     @staticmethod
     def _format_rich_output(content: dict[str, Any]) -> str:
