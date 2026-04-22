@@ -25,7 +25,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 MEGATRON_ROOT="${MEGATRON_ROOT:-/opt/Megatron-LM}"
-SLIME_ROOT="${SLIME_ROOT:-${SCRIPT_DIR}/../third_party/slime}"
+SLIME_ROOT="${SLIME_ROOT:-/opt/slime}"
 source "./scripts/models/qwen3-4B.sh"
 
 CKPT_ARGS=(
