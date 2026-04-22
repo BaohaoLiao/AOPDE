@@ -143,7 +143,7 @@ def _should_keep_message(message: Any) -> bool:
 
 def _extract_first_tool_call(prediction: str) -> dict[str, Any] | None:
     """Extract the first tool call from a model response."""
-    tool_call_pattern = r"<tool_call>\s*(\{.*?\})\s*</tool_call>"
+    tool_call_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
     tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
     if not tool_call_match:
         return None
@@ -169,7 +169,7 @@ def _build_assistant_message(prediction: str) -> dict[str, Any] | None:
             return None
         return {"role": "assistant", "content": content}
 
-    tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+    tool_call_pattern = r"<tool_call>\s*.*?\s*</tool_call>"
     tool_call_match = re.search(tool_call_pattern, sanitized_prediction, re.DOTALL)
     if tool_call_match is None:
         return {"role": "assistant", "content": sanitized_prediction.rstrip()}
@@ -345,7 +345,7 @@ def postprocess_responses(resp: str) -> str:
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
         # Keep only the first complete <tool_call>...</tool_call> block.
-        tool_call_pattern = r"<tool_call>\s*\{.*?\}\s*</tool_call>"
+        tool_call_pattern = r"<tool_call>\s*.*?\s*</tool_call>"
         match = re.search(tool_call_pattern, resp, re.DOTALL)
         if match:
             return resp[: match.end()]
