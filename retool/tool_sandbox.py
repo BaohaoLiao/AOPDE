@@ -316,7 +316,7 @@ except Exception as e:
     sys.stderr = old_stderr
     
     # Return error information
-    error_msg = f"{{str(e)}}\nTraceback:\n{{traceback.format_exc()}}"
+    error_msg = f"{{str(e)}}\\nTraceback:\\n{{traceback.format_exc()}}"
     print(error_msg)
     sys.exit(1)"""
 
