@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import socket
+import select
 import subprocess
 import sys
 import time
@@ -189,17 +190,48 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _wait_for_port(host: str, port: int, timeout: int) -> None:
+def _read_process_output(process: subprocess.Popen[str]) -> str:
+    if process.stdout is None:
+        return ""
+
+    chunks: list[str] = []
+    while True:
+        ready, _, _ = select.select([process.stdout], [], [], 0)
+        if not ready:
+            break
+        line = process.stdout.readline()
+        if line == "":
+            break
+        chunks.append(line)
+    return "".join(chunks)
+
+
+def _wait_for_port(host: str, port: int, timeout: int, process: subprocess.Popen[str] | None = None) -> None:
     deadline = time.time() + timeout
     last_error = None
+    startup_output: list[str] = []
     while time.time() < deadline:
+        if process is not None:
+            output_chunk = _read_process_output(process)
+            if output_chunk:
+                startup_output.append(output_chunk)
+            return_code = process.poll()
+            if return_code is not None:
+                output_chunk = _read_process_output(process)
+                if output_chunk:
+                    startup_output.append(output_chunk)
+                combined_output = "".join(startup_output).strip()
+                detail = f"\nServer output:\n{combined_output}" if combined_output else ""
+                raise RuntimeError(f"SGLang server exited during startup with code {return_code}.{detail}")
         try:
             with socket.create_connection((host, port), timeout=2):
                 return
         except OSError as exc:
             last_error = exc
             time.sleep(1)
-    raise TimeoutError(f"Timed out waiting for SGLang server on {host}:{port}: {last_error}")
+    combined_output = "".join(startup_output).strip()
+    detail = f"\nServer output:\n{combined_output}" if combined_output else ""
+    raise TimeoutError(f"Timed out waiting for SGLang server on {host}:{port}: {last_error}{detail}")
 
 
 def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str] | None:
@@ -225,7 +257,15 @@ def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str] | None:
     command.extend(shlex.split(args.extra_server_args))
 
     env = os.environ.copy()
-    return subprocess.Popen(command, env=env)
+    print(f"Launching SGLang server: {' '.join(shlex.quote(part) for part in command)}")
+    return subprocess.Popen(
+        command,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
 
 
 def _generate_one(args: argparse.Namespace, tokenizer: Any, prompt: Any) -> str:
@@ -398,7 +438,7 @@ def main() -> None:
 
     server_process = _launch_server(args)
     try:
-        _wait_for_port(args.host, args.port, timeout=args.server_start_timeout)
+        _wait_for_port(args.host, args.port, timeout=args.server_start_timeout, process=server_process)
 
         num_examples = len(dataset)
         num_correct = 0
