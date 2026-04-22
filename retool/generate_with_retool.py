@@ -101,6 +101,33 @@ def format_conversation_with_tools(
     return "\n".join(rendered_parts)
 
 
+def _render_recorded_messages(messages: list[dict[str, Any]]) -> str:
+    """Render recorded chat messages into transcript text without adding a new assistant turn."""
+    rendered_parts = []
+    for message in messages:
+        role = message["role"]
+        if role == "system":
+            rendered_parts.append(f"<|im_start|>system\n{message['content']}<|im_end|>")
+        elif role == "user":
+            rendered_parts.append(f"<|im_start|>user\n{message['content']}<|im_end|>")
+        elif role == "assistant":
+            assistant_text = ["<|im_start|>assistant", message.get("content", "")]
+            for tool_call in message.get("tool_calls", []):
+                assistant_text.append("<tool_call>")
+                assistant_text.append(json.dumps(tool_call["function"], ensure_ascii=False))
+                assistant_text.append("</tool_call>")
+            assistant_text.append("<|im_end|>")
+            rendered_parts.append("\n".join(part for part in assistant_text if part != ""))
+        elif role == "tool":
+            rendered_parts.append(
+                "<|im_start|>user\n"
+                "<tool_response>\n"
+                f"{message['content']}\n"
+                "</tool_response><|im_end|>"
+            )
+    return "\n".join(rendered_parts)
+
+
 def _stringify_message_content(content: Any) -> str:
     """Convert structured message content into plain text for prompting and rewards."""
     if isinstance(content, str):
@@ -238,6 +265,37 @@ def _trim_response_token_prefix(
     if len(trimmed_log_probs) < len(sanitized_token_ids):
         trimmed_log_probs = trimmed_log_probs + [0.0] * (len(sanitized_token_ids) - len(trimmed_log_probs))
     return sanitized_token_ids, trimmed_log_probs
+
+
+def _apply_final_token_clip(
+    tokenizer,
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    loss_masks: list[int],
+    rollout_log_probs: list[float] | None,
+    max_context_length: int,
+) -> tuple[list[int], str, list[int], list[int], list[float] | None, bool]:
+    """Hard-clip the final sample to the max token budget used by training."""
+    max_response_tokens = max(0, max_context_length - len(prompt_token_ids))
+    was_clipped = len(response_token_ids) > max_response_tokens
+
+    if not was_clipped:
+        response_text = tokenizer.decode(response_token_ids, skip_special_tokens=False)
+        return prompt_token_ids + response_token_ids, response_text, response_token_ids, loss_masks, rollout_log_probs, False
+
+    clipped_response_token_ids = response_token_ids[:max_response_tokens]
+    clipped_loss_masks = loss_masks[:max_response_tokens]
+    clipped_log_probs = rollout_log_probs[:max_response_tokens] if rollout_log_probs is not None else None
+    clipped_response = tokenizer.decode(clipped_response_token_ids, skip_special_tokens=False)
+    clipped_tokens = prompt_token_ids + clipped_response_token_ids
+    return (
+        clipped_tokens,
+        clipped_response,
+        clipped_response_token_ids,
+        clipped_loss_masks,
+        clipped_log_probs,
+        True,
+    )
 
 
 def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
@@ -433,6 +491,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         max_context_length = args.rollout_max_context_len
     else:
         max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
+    
+    max_context_length = max_context_length - 16  # Leave some buffer tokens for safety
 
     # Keep the sample structurally valid even if a later rollout turn aborts.
     sample.tokens = list(prompt_tokens_ids)
@@ -597,15 +657,34 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
 
     # Set sample attributes
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
-    sample.response = response
-    sample.loss_mask = loss_masks
+    (
+        final_tokens,
+        final_response,
+        final_response_token_ids,
+        final_loss_masks,
+        final_rollout_log_probs,
+        final_was_clipped,
+    ) = _apply_final_token_clip(
+        state.tokenizer,
+        prompt_tokens_ids,
+        response_token_ids,
+        loss_masks,
+        sample.rollout_log_probs,
+        max_context_length,
+    )
+
+    sample.tokens = final_tokens
+    sample.response_length = len(final_response_token_ids)
+    sample.response = final_response
+    sample.loss_mask = final_loss_masks
+    sample.rollout_log_probs = final_rollout_log_probs
+    if final_was_clipped:
+        sample.status = Sample.Status.TRUNCATED
 
     # Store payload information for wandb logging
-    sample.payload_text = prompt + response
-    sample.payload_has_system = "<|im_start|>system" in prompt + response
-    sample.payload_has_tools = "# Tools" in prompt + response
+    sample.payload_text = _render_recorded_messages(recorded_messages)
+    sample.payload_has_system = "<|im_start|>system" in sample.payload_text
+    sample.payload_has_tools = "# Tools" in sample.payload_text
     sample.sandbox_session_id = sandbox_session_id
     sample.sandbox_backend = sandbox_backend
 
