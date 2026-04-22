@@ -438,11 +438,24 @@ def main() -> None:
 
     server_process = _launch_server(args)
     try:
+        if server_process is None:
+            print(
+                f"Reusing existing SGLang server at http://{args.host}:{args.port}; "
+                f"waiting up to {args.server_start_timeout}s for it to accept connections."
+            )
+        else:
+            print(
+                f"Waiting for launched SGLang server at http://{args.host}:{args.port} "
+                f"for up to {args.server_start_timeout}s."
+            )
         _wait_for_port(args.host, args.port, timeout=args.server_start_timeout, process=server_process)
+        print(f"SGLang server is reachable at http://{args.host}:{args.port}")
 
         num_examples = len(dataset)
         num_correct = 0
         total_score = 0.0
+        per_sample_correct = [0] * args.num_samples
+        per_sample_score = [0.0] * args.num_samples
         output_file = output_path.open("w", encoding="utf-8") if output_path else None
 
         try:
@@ -461,6 +474,8 @@ def main() -> None:
                     trace["total_trace_tokens"] = generation["total_trace_tokens"]
                     trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
                     traces.append(trace)
+                    per_sample_correct[trace_index] += int(trace["acc"])
+                    per_sample_score[trace_index] += trace["score"]
                     if args.print_turns:
                         _print_trace_turns(index, trace)
 
@@ -495,6 +510,12 @@ def main() -> None:
             "num_examples": num_examples,
             "accuracy": accuracy,
             "average_score": avg_score,
+            "per_sample_accuracy": [
+                correct / num_examples if num_examples else 0.0 for correct in per_sample_correct
+            ],
+            "per_sample_average_score": [
+                score / num_examples if num_examples else 0.0 for score in per_sample_score
+            ],
             "model_path": args.model_path,
             "dataset": args.dataset,
             "split": args.split,
