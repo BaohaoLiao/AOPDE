@@ -263,7 +263,7 @@ import traceback
 from io import StringIO
 import resource
 
-    {default_import_block}
+{default_import_block}
 
 # Set memory limit (4GB)
 try:
