@@ -460,9 +460,9 @@ async def execute_predictions(
         tool_message = {
             "role": "tool",
             "content": (
-                "My previous action is invalid. "
-                "If I want to execute code, I should return a JSON object inside <tool_call></tool_call>. "
-                "If I want to give the final answer, I should use the format 'Answer: \\boxed{answer}'. Let me try again."
+                "The previous action is invalid. "
+                "If executing code, you should return a JSON object inside <tool_call></tool_call>. "
+                "If giving the final answer, you should use the format 'Answer: \\boxed{answer}'. PLease try again."
             ),
         }
         next_obs = _render_tool_message(tool_message)
