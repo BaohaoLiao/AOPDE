@@ -303,10 +303,11 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
 
 def postprocess_predictions(prediction: str):
     """Extract action and content from prediction string"""
-    # Check for Answer: \boxed{...} format (only format we need for math_dapo)
-    # Use a more robust regex that handles nested braces
-    answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-    answer_match = re.search(answer_pattern, prediction, re.DOTALL)
+    # Stop on any assistant content that contains a boxed final answer.
+    # Prefer the last boxed span so trailing reasoning before the final box is tolerated.
+    boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+    boxed_matches = list(re.finditer(boxed_pattern, prediction, re.DOTALL))
+    answer_match = boxed_matches[-1] if boxed_matches else None
     if answer_match:
         content = answer_match.group(1).strip()
         return "answer", content
@@ -362,11 +363,10 @@ def postprocess_responses(resp: str) -> str:
             last_match = matches[-1]
             return resp[: last_match.end()]
 
-    # Handle Answer: \boxed{...} format (only format we need for math_dapo)
-    if "Answer:" in resp and "\\boxed{" in resp:
-        # Find the last occurrence of Answer: \boxed{...} with nested braces support
-        answer_pattern = r"Answer:\s*\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-        matches = list(re.finditer(answer_pattern, resp, re.DOTALL))
+    # Stop once any boxed final answer appears in the assistant response.
+    if "\\boxed{" in resp:
+        boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
+        matches = list(re.finditer(boxed_pattern, resp, re.DOTALL))
         if matches:
             last_match = matches[-1]
             return resp[: last_match.end()]
