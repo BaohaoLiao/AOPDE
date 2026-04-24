@@ -538,29 +538,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             "return_logprob": True,  # Request log probabilities for training
         }
 
-        # Log payload to wandb for debugging
-        try:
-            import wandb
-
-            if wandb.run is not None:
-                # Count available tools (from tool_specs)
-                available_tools = len(tool_specs)
-                # Count tools used in the current response
-                tools_used = response.count("<tool_response>")
-
-                wandb.log(
-                    {
-                        "debug/payload_length": len(prompt + response),
-                        "debug/available_tools": available_tools,
-                        "debug/sandbox_backend": sandbox_backend,
-                        "debug/sandbox_session_id": sandbox_session_id,
-                        "debug/tools_used": tools_used,
-                        "debug/turn": turn,
-                    }
-                )
-        except ImportError:
-            pass  # wandb not available
-
         print(
             f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
         )
