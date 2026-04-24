@@ -76,6 +76,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--limit", type=int, default=None, help="Evaluate only the first N examples")
     parser.add_argument("--output", default=None, help="Optional JSONL output path for per-example results")
+    parser.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=4,
+        help="Max concurrent in-flight requests to the SGLang server (default: 4)",
+    )
     args = parser.parse_args()
     if args.num_samples < 1:
         parser.error("-n/--num-samples must be at least 1")
@@ -163,9 +169,10 @@ def _render_input_ids(tokenizer: Any, prompt: Any) -> list[int]:
     )
 
 
-async def _post_generate(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_generate(args: argparse.Namespace, payload: dict[str, Any], semaphore: asyncio.Semaphore) -> dict[str, Any]:
     url = f"http://{args.host}:{args.port}/generate"
-    return await asyncio.to_thread(_post_json, url, payload, args.request_timeout)
+    async with semaphore:
+        return await asyncio.to_thread(_post_json, url, payload, args.request_timeout)
 
 
 def _truncate_text_to_token_budget(tokenizer: Any, text: str, remaining_tokens: int) -> tuple[str, int, bool]:
@@ -283,7 +290,7 @@ def _generate_one(args: argparse.Namespace, tokenizer: Any, prompt: Any) -> str:
     return output["text"]
 
 
-async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, prompt: Any, retool_runtime: Any) -> dict[str, Any]:
+async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, prompt: Any, retool_runtime: Any, semaphore: asyncio.Semaphore) -> dict[str, Any]:
     tool_registry = retool_runtime.ToolRegistry()
     try:
         tool_specs = tool_registry.get_tool_specs()
@@ -315,7 +322,7 @@ async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, pro
                     "max_new_tokens": args.max_new_tokens,
                 },
             }
-            output = await _post_generate(args, payload)
+            output = await _post_generate(args, payload, semaphore)
             cur_response = retool_runtime.postprocess_responses(output["text"])
             if args.max_tokens is not None:
                 remaining_tokens = args.max_tokens - total_trace_tokens
@@ -463,8 +470,9 @@ def main() -> None:
                 prompt = row["prompt"]
                 label = str(row.get("label", ""))
                 async def _gather_samples() -> list[dict[str, Any]]:
+                    semaphore = asyncio.Semaphore(args.max_concurrent)
                     return list(await asyncio.gather(*[
-                        _generate_one_with_tools(args, tokenizer, prompt, retool_runtime)
+                        _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, semaphore)
                         for _ in range(args.num_samples)
                     ]))
                 generations = asyncio.run(_gather_samples())
