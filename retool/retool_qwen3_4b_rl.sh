@@ -15,6 +15,11 @@ set -ex
 # will prevent ray from buffering stdout/stderr
 export PYTHONBUFFERED=16
 
+# On clusters that run containers with UIDs not in /etc/passwd (e.g. SuperPod),
+# torch._inductor crashes trying to build a default cache path via getpass.getuser().
+# Setting this explicitly bypasses the getpwuid() call entirely.
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
     HAS_NVLINK=1
@@ -153,7 +158,9 @@ RUNTIME_ENV_JSON="{
       \"HF_HUB_OFFLINE\": \"1\",
       \"TRANSFORMERS_OFFLINE\": \"1\",
       \"TOOL_SANDBOX_BACKEND\": \"${TOOL_SANDBOX_BACKEND}\",
-      \"TOOL_SANDBOX_JUPYTER_TIMEOUT\": \"${TOOL_SANDBOX_JUPYTER_TIMEOUT}\"
+      \"TOOL_SANDBOX_JUPYTER_TIMEOUT\": \"${TOOL_SANDBOX_JUPYTER_TIMEOUT}\",
+      \"TORCHINDUCTOR_CACHE_DIR\": \"/tmp/torchinductor_cache\",
+      \"LOGNAME\": \"user\"
   }
 }"
 
