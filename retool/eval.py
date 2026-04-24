@@ -462,10 +462,12 @@ def main() -> None:
             for index, row in enumerate(dataset):
                 prompt = row["prompt"]
                 label = str(row.get("label", ""))
-                generations = asyncio.run(asyncio.gather(*[
-                    _generate_one_with_tools(args, tokenizer, prompt, retool_runtime)
-                    for _ in range(args.num_samples)
-                ]))
+                async def _gather_samples() -> list[dict[str, Any]]:
+                    return list(await asyncio.gather(*[
+                        _generate_one_with_tools(args, tokenizer, prompt, retool_runtime)
+                        for _ in range(args.num_samples)
+                    ]))
+                generations = asyncio.run(_gather_samples())
                 traces = []
                 for trace_index, generation in enumerate(generations):
                     trace = _score_response(math_dapo_compute_score, prompt, label, generation["response"])
