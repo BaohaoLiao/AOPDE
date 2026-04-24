@@ -691,6 +691,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # Store tool call count for reward calculation
     sample.tool_call_count = tool_call_count
 
+    # Expose round_number in metadata so slime logs it under multi_turn_metric/
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["round_number"] = tool_call_count
+
     # Set status
     if sample.status not in {Sample.Status.TRUNCATED, Sample.Status.ABORTED}:
         match last_finish_reason:
