@@ -484,16 +484,16 @@ def main() -> None:
                     if args.print_turns:
                         _print_trace_turns(index, trace)
 
-                best_trace = max(traces, key=lambda item: (item["score"], item["acc"]))
-                num_correct += int(best_trace["acc"])
-                total_score += best_trace["score"]
+                avg_score = sum(t["score"] for t in traces) / len(traces)
+                avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
+                num_correct += avg_acc
+                total_score += avg_score
 
                 result = {
                     "index": index,
                     "label": label,
-                    "best_pred": best_trace.get("pred"),
-                    "best_score": best_trace["score"],
-                    "best_acc": best_trace["acc"],
+                    "avg_score": avg_score,
+                    "avg_acc": avg_acc,
                     "traces": traces,
                 }
 
@@ -502,19 +502,17 @@ def main() -> None:
 
                 running_acc = num_correct / (index + 1)
                 print(
-                    f"[{index + 1}/{num_examples}] best_score={best_trace['score']:.3f} "
-                    f"best_acc={int(best_trace['acc'])} n={args.num_samples} running_acc={running_acc:.4f}"
+                    f"[{index + 1}/{num_examples}] avg_score={avg_score:.3f} "
+                    f"avg_acc={avg_acc:.3f} n={args.num_samples} running_acc={running_acc:.4f}"
                 )
         finally:
             if output_file is not None:
                 output_file.close()
 
-        accuracy = num_correct / num_examples if num_examples else 0.0
-        avg_score = total_score / num_examples if num_examples else 0.0
         summary = {
             "num_examples": num_examples,
-            "accuracy": accuracy,
-            "average_score": avg_score,
+            "accuracy": num_correct / num_examples if num_examples else 0.0,
+            "average_score": total_score / num_examples if num_examples else 0.0,
             "per_sample_accuracy": [
                 correct / num_examples if num_examples else 0.0 for correct in per_sample_correct
             ],
