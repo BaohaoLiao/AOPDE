@@ -163,9 +163,9 @@ def _render_input_ids(tokenizer: Any, prompt: Any) -> list[int]:
     )
 
 
-def _post_generate(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
+async def _post_generate(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"http://{args.host}:{args.port}/generate"
-    return _post_json(url, payload, timeout=args.request_timeout)
+    return await asyncio.to_thread(_post_json, url, payload, args.request_timeout)
 
 
 def _truncate_text_to_token_budget(tokenizer: Any, text: str, remaining_tokens: int) -> tuple[str, int, bool]:
@@ -315,7 +315,7 @@ async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, pro
                     "max_new_tokens": args.max_new_tokens,
                 },
             }
-            output = _post_generate(args, payload)
+            output = await _post_generate(args, payload)
             cur_response = retool_runtime.postprocess_responses(output["text"])
             if args.max_tokens is not None:
                 remaining_tokens = args.max_tokens - total_trace_tokens
