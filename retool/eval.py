@@ -560,8 +560,6 @@ def main() -> None:
                         trace["total_trace_tokens"] = generation["total_trace_tokens"]
                         trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
                         traces.append(trace)
-                        per_sample_correct[trace_index] += int(trace["acc"])
-                        per_sample_score[trace_index] += trace["score"]
                         if args.print_turns:
                             _print_trace_turns(index, trace)
 
