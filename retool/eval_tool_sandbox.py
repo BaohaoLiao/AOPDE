@@ -351,22 +351,24 @@ except Exception as e:
                 f.write(wrapped_code)
 
             try:
-                # Use subprocess to run code
-                process = subprocess.Popen(
-                    ["python3", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                # Use asyncio.create_subprocess_exec — natively async, no thread
+                # pool needed. asyncio.to_thread(process.communicate) exhausts the
+                # default ThreadPoolExecutor under high concurrency (>~32 tasks),
+                # which deadlocks the event loop.
+                process = await asyncio.create_subprocess_exec(
+                    "python3", script_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     env=env,
                     cwd=temp_dir,
-                    text=True,
                 )
 
-                # Run communicate() in a thread so the asyncio event loop stays
-                # responsive while waiting for the subprocess.
                 try:
-                    stdout, stderr = await asyncio.to_thread(
-                        process.communicate, timeout=self.timeout
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=self.timeout
                     )
+                    stdout = stdout_bytes.decode(errors="replace")
+                    stderr = stderr_bytes.decode(errors="replace")
 
                     if process.returncode == 0:
                         result = stdout.strip()
@@ -376,11 +378,10 @@ except Exception as e:
                         if stdout.strip():
                             result = stdout.strip()
 
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    # Drain pipes in a thread so the event loop stays responsive.
+                except asyncio.TimeoutError:
                     try:
-                        await asyncio.to_thread(process.communicate)
+                        process.kill()
+                        await process.communicate()  # drain pipes
                     except Exception:
                         pass
                     result = f"Code execution timed out after {self.timeout} seconds"
