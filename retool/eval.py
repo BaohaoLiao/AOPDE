@@ -515,8 +515,6 @@ def main() -> None:
             num_examples = len(dataset)
             num_correct = 0
             total_score = 0.0
-            per_sample_correct = [0] * args.num_samples
-            per_sample_score = [0.0] * args.num_samples
             # One semaphore shared across all examples for the lifetime of the
             # single event loop — avoids the broken-semaphore issue that occurs
             # when asyncio.run() is called once per example.
@@ -596,12 +594,6 @@ def main() -> None:
                 "num_examples": num_examples,
                 "accuracy": num_correct / num_examples if num_examples else 0.0,
                 "average_score": total_score / num_examples if num_examples else 0.0,
-                "per_sample_accuracy": [
-                    correct / num_examples if num_examples else 0.0 for correct in per_sample_correct
-                ],
-                "per_sample_average_score": [
-                    score / num_examples if num_examples else 0.0 for score in per_sample_score
-                ],
                 "model_path": args.model_path,
                 "dataset": args.dataset,
                 "split": args.split,
