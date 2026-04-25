@@ -76,6 +76,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--limit", type=int, default=None, help="Evaluate only the first N examples")
     parser.add_argument("--output", default=None, help="Optional JSONL output path for per-example results")
+    parser.add_argument("--summary-output", default=None, help="Optional JSON output path for the final summary")
     parser.add_argument(
         "--max-concurrent",
         type=int,
@@ -535,6 +536,11 @@ def main() -> None:
             "num_samples": args.num_samples,
         }
         print(json.dumps(summary, indent=2))
+        if args.summary_output:
+            summary_path = Path(args.summary_output)
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
+            print(f"Summary saved to {summary_path}")
     finally:
         if server_process is not None:
             server_process.terminate()

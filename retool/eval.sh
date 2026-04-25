@@ -12,6 +12,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-8}
 MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-16384}
 PORT=${PORT:-30000}
 OUTPUT=${OUTPUT:-${MODEL_PATH}/eval_aime2024.jsonl}
+SUMMARY_OUTPUT=${SUMMARY_OUTPUT:-${MODEL_PATH}/eval_aime2024_summary.json}
 
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
 export TOOL_SANDBOX_BACKEND=${TOOL_SANDBOX_BACKEND:-"subprocess"}
@@ -32,4 +33,5 @@ python eval.py \
     --port ${PORT} \
     --max-concurrent 16 \
     --output "${OUTPUT}" \
+    --summary-output "${SUMMARY_OUTPUT}" \
     --print-turns
