@@ -561,99 +561,114 @@ def main() -> None:
 
         async def _run_eval() -> dict[str, Any]:
             num_examples = len(dataset)
-            num_correct = 0
-            total_score = 0.0
             # One semaphore shared across all examples for the lifetime of the
             # single event loop — avoids the broken-semaphore issue that occurs
             # when asyncio.run() is called once per example.
             semaphore = asyncio.Semaphore(args.max_concurrent)
             output_file = output_path.open("w", encoding="utf-8") if output_path else None
+            output_lock = asyncio.Lock()
 
-            try:
-                for index, row in enumerate(dataset):
-                    prompt = row["problem"]
-                    label = str(row.get("gt", ""))
+            # Snapshot rows so we don't iterate the HF dataset across many tasks.
+            rows = [(i, dataset[i]) for i in range(num_examples)]
 
-                    async def _safe_generate(idx: int) -> dict[str, Any]:
-                        async with semaphore:
-                            tag = f"[ex{index} s{idx}]"
-                            t0 = time.time()
-                            try:
-                                return await asyncio.wait_for(
-                                    _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, debug_tag=tag),
-                                    timeout=args.sample_timeout,
-                                )
-                            except asyncio.TimeoutError:
-                                print(
-                                    f"{tag} SAMPLE-TIMEOUT after {args.sample_timeout}s "
-                                    f"(wall={time.time() - t0:.1f}s)",
-                                    flush=True,
-                                )
-                                return {
-                                    "response": "",
-                                    "turns": [],
-                                    "tool_call_count": 0,
-                                    "tool_backend": "unknown",
-                                    "sandbox_session_id": "timeout",
-                                    "total_trace_tokens": 0,
-                                    "stopped_due_to_max_tokens": False,
-                                }
-                            except Exception as exc:
-                                print(
-                                    f"{tag} ERROR {type(exc).__name__}: {exc} "
-                                    f"(wall={time.time() - t0:.1f}s)",
-                                    flush=True,
-                                )
-                                return {
-                                    "response": "",
-                                    "turns": [],
-                                    "tool_call_count": 0,
-                                    "tool_backend": "unknown",
-                                    "sandbox_session_id": "error",
-                                    "total_trace_tokens": 0,
-                                    "stopped_due_to_max_tokens": False,
-                                }
+            done_examples = 0
+            num_correct = 0.0
+            total_score = 0.0
 
-                    generations = list(await asyncio.gather(*[
-                        _safe_generate(i)
-                        for i in range(args.num_samples)
-                    ]))
+            async def _safe_generate(ex_index: int, sample_idx: int, prompt: Any) -> dict[str, Any]:
+                async with semaphore:
+                    tag = f"[ex{ex_index} s{sample_idx}]"
+                    t0 = time.time()
+                    try:
+                        return await asyncio.wait_for(
+                            _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, debug_tag=tag),
+                            timeout=args.sample_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        print(
+                            f"{tag} SAMPLE-TIMEOUT after {args.sample_timeout}s "
+                            f"(wall={time.time() - t0:.1f}s)",
+                            flush=True,
+                        )
+                        return {
+                            "response": "",
+                            "turns": [],
+                            "tool_call_count": 0,
+                            "tool_backend": "unknown",
+                            "sandbox_session_id": "timeout",
+                            "total_trace_tokens": 0,
+                            "stopped_due_to_max_tokens": False,
+                        }
+                    except Exception as exc:
+                        print(
+                            f"{tag} ERROR {type(exc).__name__}: {exc} "
+                            f"(wall={time.time() - t0:.1f}s)",
+                            flush=True,
+                        )
+                        return {
+                            "response": "",
+                            "turns": [],
+                            "tool_call_count": 0,
+                            "tool_backend": "unknown",
+                            "sandbox_session_id": "error",
+                            "total_trace_tokens": 0,
+                            "stopped_due_to_max_tokens": False,
+                        }
 
-                    traces = []
-                    for trace_index, generation in enumerate(generations):
-                        trace = _score_response(math_dapo_compute_score, prompt, label, generation["response"])
-                        trace["trace_index"] = trace_index
-                        trace["turns"] = generation["turns"]
-                        trace["tool_call_count"] = generation["tool_call_count"]
-                        trace["tool_backend"] = generation["tool_backend"]
-                        trace["sandbox_session_id"] = generation["sandbox_session_id"]
-                        trace["total_trace_tokens"] = generation["total_trace_tokens"]
-                        trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
-                        traces.append(trace)
-                        if args.print_turns:
-                            _print_trace_turns(index, trace)
+            async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
+                nonlocal done_examples, num_correct, total_score
+                prompt = row["problem"]
+                label = str(row.get("gt", ""))
 
-                    avg_score = sum(t["score"] for t in traces) / len(traces)
-                    avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
+                generations = await asyncio.gather(*[
+                    _safe_generate(ex_index, i, prompt)
+                    for i in range(args.num_samples)
+                ])
+
+                traces = []
+                for trace_index, generation in enumerate(generations):
+                    trace = _score_response(math_dapo_compute_score, prompt, label, generation["response"])
+                    trace["trace_index"] = trace_index
+                    trace["turns"] = generation["turns"]
+                    trace["tool_call_count"] = generation["tool_call_count"]
+                    trace["tool_backend"] = generation["tool_backend"]
+                    trace["sandbox_session_id"] = generation["sandbox_session_id"]
+                    trace["total_trace_tokens"] = generation["total_trace_tokens"]
+                    trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
+                    traces.append(trace)
+                    if args.print_turns:
+                        _print_trace_turns(ex_index, trace)
+
+                avg_score = sum(t["score"] for t in traces) / len(traces)
+                avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
+
+                result = {
+                    "index": ex_index,
+                    "label": label,
+                    "avg_score": avg_score,
+                    "avg_acc": avg_acc,
+                    "traces": traces,
+                }
+
+                async with output_lock:
                     num_correct += avg_acc
                     total_score += avg_score
-
-                    result = {
-                        "index": index,
-                        "label": label,
-                        "avg_score": avg_score,
-                        "avg_acc": avg_acc,
-                        "traces": traces,
-                    }
-
+                    done_examples += 1
                     if output_file is not None:
                         output_file.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-                    running_acc = num_correct / (index + 1)
+                        output_file.flush()
+                    running_acc = num_correct / done_examples if done_examples else 0.0
                     print(
-                        f"[{index + 1}/{num_examples}] avg_score={avg_score:.3f} "
-                        f"avg_acc={avg_acc:.3f} n={args.num_samples} running_acc={running_acc:.4f}"
+                        f"[{done_examples}/{num_examples}] ex{ex_index} "
+                        f"avg_score={avg_score:.3f} avg_acc={avg_acc:.3f} "
+                        f"n={args.num_samples} running_acc={running_acc:.4f}",
+                        flush=True,
                     )
+
+            try:
+                await asyncio.gather(*[
+                    _process_example(idx, row) for idx, row in rows
+                ])
             finally:
                 if output_file is not None:
                     output_file.close()
