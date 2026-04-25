@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Tokenizer path. Defaults to --model-path.",
     )
-    parser.add_argument("--dataset", default="zhuzilin/aime-2024", help="HF dataset name or local dataset path")
+    parser.add_argument("--dataset", default="baohao/aime24", help="HF dataset name or local dataset path")
     parser.add_argument("--split", default="train", help="Dataset split to evaluate")
     parser.add_argument("--host", default="127.0.0.1", help="SGLang server host")
     parser.add_argument("--port", type=int, default=30000, help="SGLang server port")

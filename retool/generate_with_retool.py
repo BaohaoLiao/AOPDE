@@ -485,7 +485,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_specs = tool_registry.get_tool_specs()
     prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    recorded_messages = _build_initial_recorded_messages(sample.prompt)
+    # Build recorded_messages with the full system prompt (including tool descriptions)
+    # so that payload_text faithfully reflects what the model actually sees.
+    full_system_prompt = DEFAULT_SYSTEM_PROMPT
+    if tool_specs:
+        tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tool_specs)
+        full_system_prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+    recorded_messages = _build_initial_recorded_messages(sample.prompt, system_prompt=full_system_prompt)
     interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
         max_context_length = args.rollout_max_context_len
