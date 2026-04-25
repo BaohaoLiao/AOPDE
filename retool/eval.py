@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         help="Reuse an already-running SGLang server instead of launching one.",
     )
     parser.add_argument("--server-start-timeout", type=int, default=180, help="Seconds to wait for server startup")
-    parser.add_argument("--request-timeout", type=int, default=600, help="HTTP timeout per generation request")
+    parser.add_argument("--request-timeout", type=int, default=1800, help="HTTP timeout per generation request")
     parser.add_argument("--max-new-tokens", type=int, default=8192, help="Max new tokens per sample")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
@@ -213,12 +213,20 @@ async def _post_json_async(url: str, payload: dict[str, Any], timeout: int) -> d
         f"\r\n"
     ).encode() + body
 
-    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
     try:
-        writer.write(http_request)
-        await asyncio.wait_for(writer.drain(), timeout=10)
-        # read(-1) reads until EOF — server closes connection after response with Connection: close
-        response_bytes = await asyncio.wait_for(reader.read(-1), timeout=timeout)
+        reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"HTTP connect to {host}:{port} timed out after 10s") from exc
+    try:
+        try:
+            writer.write(http_request)
+            await asyncio.wait_for(writer.drain(), timeout=10)
+            # read(-1) reads until EOF — server closes connection after response with Connection: close
+            response_bytes = await asyncio.wait_for(reader.read(-1), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise RuntimeError(
+                f"HTTP request to {host}:{port}{path} timed out after {timeout}s (server overloaded?)"
+            ) from exc
     finally:
         writer.close()
         try:
@@ -577,7 +585,7 @@ def main() -> None:
                                 )
                             except asyncio.TimeoutError:
                                 print(
-                                    f"{tag} timed out after {args.sample_timeout}s "
+                                    f"{tag} SAMPLE-TIMEOUT after {args.sample_timeout}s "
                                     f"(wall={time.time() - t0:.1f}s)",
                                     flush=True,
                                 )
@@ -587,6 +595,21 @@ def main() -> None:
                                     "tool_call_count": 0,
                                     "tool_backend": "unknown",
                                     "sandbox_session_id": "timeout",
+                                    "total_trace_tokens": 0,
+                                    "stopped_due_to_max_tokens": False,
+                                }
+                            except Exception as exc:
+                                print(
+                                    f"{tag} ERROR {type(exc).__name__}: {exc} "
+                                    f"(wall={time.time() - t0:.1f}s)",
+                                    flush=True,
+                                )
+                                return {
+                                    "response": "",
+                                    "turns": [],
+                                    "tool_call_count": 0,
+                                    "tool_backend": "unknown",
+                                    "sandbox_session_id": "error",
                                     "total_trace_tokens": 0,
                                     "stopped_due_to_max_tokens": False,
                                 }
