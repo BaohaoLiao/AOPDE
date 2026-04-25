@@ -336,21 +336,30 @@ except Exception as e:
                     text=True,
                 )
 
-                # Set timeout
-                try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
+                def _communicate(proc: subprocess.Popen, timeout: int) -> tuple[str, str, str | None]:
+                    """Run in thread pool to avoid blocking the event loop."""
+                    try:
+                        stdout, stderr = proc.communicate(timeout=timeout)
+                        return stdout, stderr, None
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.communicate()  # drain pipes and wait for SIGKILL
+                        return "", "", f"Code execution timed out after {timeout} seconds"
 
-                    if process.returncode == 0:
+                # Run communicate() in a thread so the event loop stays responsive.
+                stdout, stderr, timeout_msg = await asyncio.to_thread(
+                    _communicate, process, self.timeout
+                )
+
+                if timeout_msg is not None:
+                    result = timeout_msg
+                elif process.returncode == 0:
+                    result = stdout.strip()
+                    self._successful_code = combined_code
+                else:
+                    result = f"Process exited with code {process.returncode}\n{stderr}"
+                    if stdout.strip():
                         result = stdout.strip()
-                        self._successful_code = combined_code
-                    else:
-                        result = f"Process exited with code {process.returncode}\n{stderr}"
-                        if stdout.strip():
-                            result = stdout.strip()
-
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    result = f"Code execution timed out after {self.timeout} seconds"
 
             except Exception as e:
                 result = f"Failed to execute code: {str(e)}"
