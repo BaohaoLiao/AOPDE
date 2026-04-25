@@ -461,83 +461,80 @@ def main() -> None:
         _wait_for_port(args.host, args.port, timeout=args.server_start_timeout, process=server_process)
         print(f"SGLang server is reachable at http://{args.host}:{args.port}")
 
-        async def _run_eval() -> dict[str, Any]:
-            num_examples = len(dataset)
-            num_correct = 0
-            total_score = 0.0
-            per_sample_correct = [0] * args.num_samples
-            per_sample_score = [0.0] * args.num_samples
-            semaphore = asyncio.Semaphore(args.max_concurrent)
-            output_file = output_path.open("w", encoding="utf-8") if output_path else None
+        num_examples = len(dataset)
+        num_correct = 0
+        total_score = 0.0
+        per_sample_correct = [0] * args.num_samples
+        per_sample_score = [0.0] * args.num_samples
+        output_file = output_path.open("w", encoding="utf-8") if output_path else None
 
-            try:
-                for index, row in enumerate(dataset):
-                    prompt = row["problem"]
-                    label = str(row.get("gt", ""))
-
-                    generations = list(await asyncio.gather(*[
+        try:
+            for index, row in enumerate(dataset):
+                prompt = row["problem"]
+                label = str(row.get("gt", ""))
+                async def _gather_samples() -> list[dict[str, Any]]:
+                    semaphore = asyncio.Semaphore(args.max_concurrent)
+                    return list(await asyncio.gather(*[
                         _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, semaphore)
                         for _ in range(args.num_samples)
                     ]))
+                generations = asyncio.run(_gather_samples())
+                traces = []
+                for trace_index, generation in enumerate(generations):
+                    trace = _score_response(math_dapo_compute_score, prompt, label, generation["response"])
+                    trace["trace_index"] = trace_index
+                    trace["turns"] = generation["turns"]
+                    trace["tool_call_count"] = generation["tool_call_count"]
+                    trace["tool_backend"] = generation["tool_backend"]
+                    trace["sandbox_session_id"] = generation["sandbox_session_id"]
+                    trace["total_trace_tokens"] = generation["total_trace_tokens"]
+                    trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
+                    traces.append(trace)
+                    per_sample_correct[trace_index] += int(trace["acc"])
+                    per_sample_score[trace_index] += trace["score"]
+                    if args.print_turns:
+                        _print_trace_turns(index, trace)
 
-                    traces = []
-                    for trace_index, generation in enumerate(generations):
-                        trace = _score_response(math_dapo_compute_score, prompt, label, generation["response"])
-                        trace["trace_index"] = trace_index
-                        trace["turns"] = generation["turns"]
-                        trace["tool_call_count"] = generation["tool_call_count"]
-                        trace["tool_backend"] = generation["tool_backend"]
-                        trace["sandbox_session_id"] = generation["sandbox_session_id"]
-                        trace["total_trace_tokens"] = generation["total_trace_tokens"]
-                        trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
-                        traces.append(trace)
-                        per_sample_correct[trace_index] += int(trace["acc"])
-                        per_sample_score[trace_index] += trace["score"]
-                        if args.print_turns:
-                            _print_trace_turns(index, trace)
+                avg_score = sum(t["score"] for t in traces) / len(traces)
+                avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
+                num_correct += avg_acc
+                total_score += avg_score
 
-                    avg_score = sum(t["score"] for t in traces) / len(traces)
-                    avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
-                    num_correct += avg_acc
-                    total_score += avg_score
+                result = {
+                    "index": index,
+                    "label": label,
+                    "avg_score": avg_score,
+                    "avg_acc": avg_acc,
+                    "traces": traces,
+                }
 
-                    result = {
-                        "index": index,
-                        "label": label,
-                        "avg_score": avg_score,
-                        "avg_acc": avg_acc,
-                        "traces": traces,
-                    }
-
-                    if output_file is not None:
-                        output_file.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-                    running_acc = num_correct / (index + 1)
-                    print(
-                        f"[{index + 1}/{num_examples}] avg_score={avg_score:.3f} "
-                        f"avg_acc={avg_acc:.3f} n={args.num_samples} running_acc={running_acc:.4f}"
-                    )
-            finally:
                 if output_file is not None:
-                    output_file.close()
+                    output_file.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-            return {
-                "num_examples": num_examples,
-                "accuracy": num_correct / num_examples if num_examples else 0.0,
-                "average_score": total_score / num_examples if num_examples else 0.0,
-                "per_sample_accuracy": [
-                    correct / num_examples if num_examples else 0.0 for correct in per_sample_correct
-                ],
-                "per_sample_average_score": [
-                    score / num_examples if num_examples else 0.0 for score in per_sample_score
-                ],
-                "model_path": args.model_path,
-                "dataset": args.dataset,
-                "split": args.split,
-                "num_samples": args.num_samples,
-            }
+                running_acc = num_correct / (index + 1)
+                print(
+                    f"[{index + 1}/{num_examples}] avg_score={avg_score:.3f} "
+                    f"avg_acc={avg_acc:.3f} n={args.num_samples} running_acc={running_acc:.4f}"
+                )
+        finally:
+            if output_file is not None:
+                output_file.close()
 
-        summary = asyncio.run(_run_eval())
+        summary = {
+            "num_examples": num_examples,
+            "accuracy": num_correct / num_examples if num_examples else 0.0,
+            "average_score": total_score / num_examples if num_examples else 0.0,
+            "per_sample_accuracy": [
+                correct / num_examples if num_examples else 0.0 for correct in per_sample_correct
+            ],
+            "per_sample_average_score": [
+                score / num_examples if num_examples else 0.0 for score in per_sample_score
+            ],
+            "model_path": args.model_path,
+            "dataset": args.dataset,
+            "split": args.split,
+            "num_samples": args.num_samples,
+        }
         print(json.dumps(summary, indent=2))
         if args.summary_output:
             summary_path = Path(args.summary_output)
