@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import importlib
+import urllib.parse
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -181,7 +182,50 @@ def _render_input_ids(tokenizer: Any, prompt: Any) -> list[int]:
 async def _post_generate(args: argparse.Namespace, payload: dict[str, Any], semaphore: asyncio.Semaphore) -> dict[str, Any]:
     url = f"http://{args.host}:{args.port}/generate"
     async with semaphore:
-        return await asyncio.to_thread(_post_json, url, payload, args.request_timeout)
+        return await _post_json_async(url, payload, args.request_timeout)
+
+
+async def _post_json_async(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
+    """Native-async HTTP POST using asyncio streams.
+
+    Unlike asyncio.to_thread(_post_json, ...), this is truly cancellable:
+    when asyncio.wait_for times out and raises CancelledError, the TCP
+    connection is closed immediately and no thread pool slot is held.
+    """
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+
+    body = json.dumps(payload).encode("utf-8")
+    http_request = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode() + body
+
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=10)
+    try:
+        writer.write(http_request)
+        await asyncio.wait_for(writer.drain(), timeout=10)
+        # read(-1) reads until EOF — server closes connection after response with Connection: close
+        response_bytes = await asyncio.wait_for(reader.read(-1), timeout=timeout)
+    finally:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=5)
+        except Exception:
+            pass
+
+    sep = response_bytes.find(b"\r\n\r\n")
+    if sep == -1:
+        raise ValueError(f"Malformed HTTP response (no header separator): {response_bytes[:200]}")
+    return json.loads(response_bytes[sep + 4:])
 
 
 def _truncate_text_to_token_budget(tokenizer: Any, text: str, remaining_tokens: int) -> tuple[str, int, bool]:
