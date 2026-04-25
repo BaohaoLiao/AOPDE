@@ -83,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         default=4,
         help="Max concurrent in-flight requests to the SGLang server (default: 4)",
     )
+    parser.add_argument(
+        "--sample-timeout",
+        type=int,
+        default=300,
+        help="Max seconds allowed for a single trace (all turns combined). Timed-out traces are scored as incorrect (default: 300).",
+    )
     args = parser.parse_args()
     if args.num_samples < 1:
         parser.error("-n/--num-samples must be at least 1")
@@ -478,9 +484,27 @@ def main() -> None:
                     prompt = row["problem"]
                     label = str(row.get("gt", ""))
 
+                    async def _safe_generate(idx: int) -> dict[str, Any]:
+                        try:
+                            return await asyncio.wait_for(
+                                _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, semaphore),
+                                timeout=args.sample_timeout,
+                            )
+                        except asyncio.TimeoutError:
+                            print(f"[example {index} sample {idx}] timed out after {args.sample_timeout}s")
+                            return {
+                                "response": "",
+                                "turns": [],
+                                "tool_call_count": 0,
+                                "tool_backend": "unknown",
+                                "sandbox_session_id": "timeout",
+                                "total_trace_tokens": 0,
+                                "stopped_due_to_max_tokens": False,
+                            }
+
                     generations = list(await asyncio.gather(*[
-                        _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, semaphore)
-                        for _ in range(args.num_samples)
+                        _safe_generate(i)
+                        for i in range(args.num_samples)
                     ]))
 
                     traces = []
