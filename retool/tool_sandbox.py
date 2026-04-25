@@ -32,7 +32,7 @@ TOOL_CONFIGS = {
     "tool_concurrency": int(os.environ.get("TOOL_SANDBOX_CONCURRENCY", "32")),
     "sandbox_backend": os.environ.get("TOOL_SANDBOX_BACKEND", "subprocess").lower(),
     # Python interpreter settings
-    "python_timeout": 120,  # 2 minutes for complex calculations
+    "python_timeout": int(os.environ.get("TOOL_SANDBOX_PYTHON_TIMEOUT", "60")),  # subprocess backend per-call timeout
     "jupyter_timeout": int(os.environ.get("TOOL_SANDBOX_JUPYTER_TIMEOUT", "300")),
     "python_memory_limit": "4GB",  # 4GB per Python process
     "python_cpu_limit": 1,
@@ -326,19 +326,22 @@ except Exception as e:
                 f.write(wrapped_code)
 
             try:
-                # Use subprocess to run code
-                process = subprocess.Popen(
-                    ["python3", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                # Use asyncio subprocess so we don't block the event loop.
+                process = await asyncio.create_subprocess_exec(
+                    "python3",
+                    script_path,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                     env=env,
                     cwd=temp_dir,
-                    text=True,
                 )
 
-                # Set timeout
                 try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
+                    stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                        process.communicate(), timeout=self.timeout
+                    )
+                    stdout = stdout_bytes.decode("utf-8", errors="replace")
+                    stderr = stderr_bytes.decode("utf-8", errors="replace")
 
                     if process.returncode == 0:
                         result = stdout.strip()
@@ -348,8 +351,15 @@ except Exception as e:
                         if stdout.strip():
                             result = stdout.strip()
 
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                except asyncio.TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
                     result = f"Code execution timed out after {self.timeout} seconds"
 
             except Exception as e:
