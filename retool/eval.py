@@ -179,10 +179,9 @@ def _render_input_ids(tokenizer: Any, prompt: Any) -> list[int]:
     )
 
 
-async def _post_generate(args: argparse.Namespace, payload: dict[str, Any], semaphore: asyncio.Semaphore) -> dict[str, Any]:
+async def _post_generate(args: argparse.Namespace, payload: dict[str, Any]) -> dict[str, Any]:
     url = f"http://{args.host}:{args.port}/generate"
-    async with semaphore:
-        return await _post_json_async(url, payload, args.request_timeout)
+    return await _post_json_async(url, payload, args.request_timeout)
 
 
 async def _post_json_async(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any]:
@@ -343,7 +342,7 @@ def _generate_one(args: argparse.Namespace, tokenizer: Any, prompt: Any) -> str:
     return output["text"]
 
 
-async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, prompt: Any, retool_runtime: Any, semaphore: asyncio.Semaphore) -> dict[str, Any]:
+async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, prompt: Any, retool_runtime: Any) -> dict[str, Any]:
     tool_registry = retool_runtime.ToolRegistry()
     try:
         tool_specs = tool_registry.get_tool_specs()
@@ -375,7 +374,7 @@ async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, pro
                     "max_new_tokens": args.max_new_tokens,
                 },
             }
-            output = await _post_generate(args, payload, semaphore)
+            output = await _post_generate(args, payload)
             cur_response = retool_runtime.postprocess_responses(output["text"])
             if args.max_tokens is not None:
                 remaining_tokens = args.max_tokens - total_trace_tokens
@@ -527,22 +526,23 @@ def main() -> None:
                     label = str(row.get("gt", ""))
 
                     async def _safe_generate(idx: int) -> dict[str, Any]:
-                        try:
-                            return await asyncio.wait_for(
-                                _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, semaphore),
-                                timeout=args.sample_timeout,
-                            )
-                        except asyncio.TimeoutError:
-                            print(f"[example {index} sample {idx}] timed out after {args.sample_timeout}s")
-                            return {
-                                "response": "",
-                                "turns": [],
-                                "tool_call_count": 0,
-                                "tool_backend": "unknown",
-                                "sandbox_session_id": "timeout",
-                                "total_trace_tokens": 0,
-                                "stopped_due_to_max_tokens": False,
-                            }
+                        async with semaphore:
+                            try:
+                                return await asyncio.wait_for(
+                                    _generate_one_with_tools(args, tokenizer, prompt, retool_runtime),
+                                    timeout=args.sample_timeout,
+                                )
+                            except asyncio.TimeoutError:
+                                print(f"[example {index} sample {idx}] timed out after {args.sample_timeout}s")
+                                return {
+                                    "response": "",
+                                    "turns": [],
+                                    "tool_call_count": 0,
+                                    "tool_backend": "unknown",
+                                    "sandbox_session_id": "timeout",
+                                    "total_trace_tokens": 0,
+                                    "stopped_due_to_max_tokens": False,
+                                }
 
                     generations = list(await asyncio.gather(*[
                         _safe_generate(i)
