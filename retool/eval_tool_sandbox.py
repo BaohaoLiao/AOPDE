@@ -587,6 +587,21 @@ class ToolRegistry:
         if not code.strip():
             return "Error: No code provided"
 
+        # Strip markdown code-fence wrappers that models sometimes emit, e.g.
+        # ```py\n...\n``` or ```python\n...\n```
+        stripped = code.strip()
+        if stripped.startswith("```"):
+            # Remove the opening fence line (```py, ```python, ``` …)
+            first_newline = stripped.find("\n")
+            if first_newline != -1:
+                stripped = stripped[first_newline + 1:]
+            else:
+                stripped = stripped[3:]
+            # Remove the closing fence
+            if stripped.endswith("```"):
+                stripped = stripped[: stripped.rfind("```")]
+            code = stripped.strip()
+
         # Execute code in sandbox
         result = await self.python_sandbox.execute_code(code)
         return result
