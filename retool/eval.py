@@ -95,6 +95,8 @@ def _load_dataset_records(args: argparse.Namespace):
         dataset_path = Path(args.dataset)
         if dataset_path.suffix == ".jsonl":
             dataset = load_dataset("json", data_files=str(dataset_path), split="train")
+        elif dataset_path.suffix == ".parquet":
+            dataset = load_dataset("parquet", data_files=str(dataset_path), split="train")
         else:
             dataset = load_dataset(str(dataset_path), split=args.split)
     else:
@@ -467,8 +469,8 @@ def main() -> None:
 
         try:
             for index, row in enumerate(dataset):
-                prompt = row["prompt"]
-                label = str(row.get("label", ""))
+                prompt = row["problem"]
+                label = str(row.get("gt", ""))
                 async def _gather_samples() -> list[dict[str, Any]]:
                     semaphore = asyncio.Semaphore(args.max_concurrent)
                     return list(await asyncio.gather(*[
