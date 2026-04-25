@@ -154,10 +154,10 @@ def _load_math_dapo_compute_score():
 
 def _load_retool_runtime():
     try:
-        return importlib.import_module("generate_with_retool")
+        return importlib.import_module("eval_generate_with_retool")
     except ImportError as exc:
         raise ImportError(
-            "Failed to import retool/generate_with_retool.py. Check the ReTool dependencies in the active environment."
+            "Failed to import retool/eval_generate_with_retool.py. Check the ReTool dependencies in the active environment."
         ) from exc
 
 
