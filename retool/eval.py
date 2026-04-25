@@ -574,6 +574,9 @@ def main() -> None:
             done_examples = 0
             num_correct = 0.0
             total_score = 0.0
+            all_timeout_examples: list[dict[str, Any]] = []
+            total_timeouts = 0
+            examples_with_any_timeout = 0
 
             async def _safe_generate(ex_index: int, sample_idx: int, prompt: Any) -> dict[str, Any]:
                 async with semaphore:
@@ -616,7 +619,7 @@ def main() -> None:
                         }
 
             async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
-                nonlocal done_examples, num_correct, total_score
+                nonlocal done_examples, num_correct, total_score, total_timeouts, examples_with_any_timeout
                 prompt = row["problem"]
                 label = str(row.get("gt", ""))
 
@@ -635,33 +638,63 @@ def main() -> None:
                     trace["sandbox_session_id"] = generation["sandbox_session_id"]
                     trace["total_trace_tokens"] = generation["total_trace_tokens"]
                     trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
+                    trace["timed_out"] = generation["sandbox_session_id"] in ("timeout", "error")
                     traces.append(trace)
                     if args.print_turns:
                         _print_trace_turns(ex_index, trace)
 
+                valid_traces = [t for t in traces if not t["timed_out"]]
+                num_timeouts = len(traces) - len(valid_traces)
+                all_timed_out = len(valid_traces) == 0
+
+                # avg over all samples (timeouts penalized) — kept for backward compat
                 avg_score = sum(t["score"] for t in traces) / len(traces)
                 avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
 
+                # avg over non-timeout samples only — used for the final overall metric
+                if all_timed_out:
+                    avg_acc_excl_timeout = 0.0
+                    avg_score_excl_timeout = 0.0
+                else:
+                    avg_acc_excl_timeout = sum(int(t["acc"]) for t in valid_traces) / len(valid_traces)
+                    avg_score_excl_timeout = sum(t["score"] for t in valid_traces) / len(valid_traces)
+
                 result = {
                     "index": ex_index,
+                    "prompt": prompt,
                     "label": label,
                     "avg_score": avg_score,
                     "avg_acc": avg_acc,
+                    "avg_acc_excl_timeout": avg_acc_excl_timeout,
+                    "avg_score_excl_timeout": avg_score_excl_timeout,
+                    "num_timeouts": num_timeouts,
+                    "all_timed_out": all_timed_out,
                     "traces": traces,
                 }
 
                 async with output_lock:
-                    num_correct += avg_acc
-                    total_score += avg_score
+                    num_correct += avg_acc_excl_timeout
+                    total_score += avg_score_excl_timeout
                     done_examples += 1
+                    total_timeouts += num_timeouts
+                    if num_timeouts > 0:
+                        examples_with_any_timeout += 1
+                    if all_timed_out:
+                        all_timeout_examples.append({
+                            "index": ex_index,
+                            "prompt": prompt,
+                            "label": label,
+                            "num_samples": args.num_samples,
+                        })
                     if output_file is not None:
                         output_file.write(json.dumps(result, ensure_ascii=False) + "\n")
                         output_file.flush()
                     running_acc = num_correct / done_examples if done_examples else 0.0
                     print(
                         f"[{done_examples}/{num_examples}] ex{ex_index} "
-                        f"avg_score={avg_score:.3f} avg_acc={avg_acc:.3f} "
-                        f"n={args.num_samples} running_acc={running_acc:.4f}",
+                        f"avg_acc_excl_timeout={avg_acc_excl_timeout:.3f} "
+                        f"timeouts={num_timeouts}/{args.num_samples} "
+                        f"running_acc={running_acc:.4f}",
                         flush=True,
                     )
 
@@ -673,10 +706,21 @@ def main() -> None:
                 if output_file is not None:
                     output_file.close()
 
+            total_samples = num_examples * args.num_samples
             return {
                 "num_examples": num_examples,
                 "accuracy": num_correct / num_examples if num_examples else 0.0,
                 "average_score": total_score / num_examples if num_examples else 0.0,
+                "timeout_stats": {
+                    "total_samples": total_samples,
+                    "total_timeouts": total_timeouts,
+                    "timeout_rate": total_timeouts / total_samples if total_samples else 0.0,
+                    "examples_with_any_timeout": examples_with_any_timeout,
+                    "examples_all_timeout": len(all_timeout_examples),
+                    "sample_timeout_seconds": args.sample_timeout,
+                    "request_timeout_seconds": args.request_timeout,
+                },
+                "all_timeout_examples": all_timeout_examples,
                 "model_path": args.model_path,
                 "dataset": args.dataset,
                 "split": args.split,
