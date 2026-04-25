@@ -36,4 +36,5 @@ python eval.py \
     --output "${OUTPUT}" \
     --summary-output "${SUMMARY_OUTPUT}" \
     --sample-timeout ${SAMPLE_TIMEOUT} \
+    --debug-trace \
     --print-turns

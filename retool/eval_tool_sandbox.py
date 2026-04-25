@@ -32,7 +32,7 @@ TOOL_CONFIGS = {
     "tool_concurrency": int(os.environ.get("TOOL_SANDBOX_CONCURRENCY", "32")),
     "sandbox_backend": os.environ.get("TOOL_SANDBOX_BACKEND", "subprocess").lower(),
     # Python interpreter settings
-    "python_timeout": 120,  # 2 minutes for complex calculations
+    "python_timeout": int(os.environ.get("TOOL_SANDBOX_PYTHON_TIMEOUT", "120")),  # subprocess backend per-call timeout
     "jupyter_timeout": int(os.environ.get("TOOL_SANDBOX_JUPYTER_TIMEOUT", "300")),
     "python_memory_limit": "4GB",  # 4GB per Python process
     "python_cpu_limit": 1,

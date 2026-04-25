@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         default=300,
         help="Max seconds allowed for a single trace (all turns combined). Timed-out traces are scored as incorrect (default: 300).",
     )
+    parser.add_argument(
+        "--debug-trace",
+        action="store_true",
+        help="Print per-turn START/GEN/TOOL debug lines with elapsed times to diagnose timeouts.",
+    )
     args = parser.parse_args()
     if args.num_samples < 1:
         parser.error("-n/--num-samples must be at least 1")
@@ -342,8 +347,17 @@ def _generate_one(args: argparse.Namespace, tokenizer: Any, prompt: Any) -> str:
     return output["text"]
 
 
-async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, prompt: Any, retool_runtime: Any) -> dict[str, Any]:
+async def _generate_one_with_tools(
+    args: argparse.Namespace,
+    tokenizer: Any,
+    prompt: Any,
+    retool_runtime: Any,
+    debug_tag: str = "",
+) -> dict[str, Any]:
     tool_registry = retool_runtime.ToolRegistry()
+    trace_start = time.time()
+    if args.debug_trace:
+        print(f"{debug_tag} START backend={tool_registry.backend} session={tool_registry.session_id}", flush=True)
     try:
         tool_specs = tool_registry.get_tool_specs()
         interaction_messages: list[dict[str, Any]] = []
@@ -374,8 +388,22 @@ async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, pro
                     "max_new_tokens": args.max_new_tokens,
                 },
             }
+            if args.debug_trace:
+                print(
+                    f"{debug_tag} turn={turn_index} GEN-> input_tokens={len(input_ids)} "
+                    f"trace_tokens={total_trace_tokens} elapsed={time.time() - trace_start:.1f}s",
+                    flush=True,
+                )
+            gen_t0 = time.time()
             output = await _post_generate(args, payload)
+            gen_dt = time.time() - gen_t0
             cur_response = retool_runtime.postprocess_responses(output["text"])
+            if args.debug_trace:
+                print(
+                    f"{debug_tag} turn={turn_index} GEN<- gen_s={gen_dt:.1f} "
+                    f"resp_chars={len(cur_response)}",
+                    flush=True,
+                )
             if args.max_tokens is not None:
                 remaining_tokens = args.max_tokens - total_trace_tokens
                 cur_response, response_token_count, response_was_truncated = _truncate_text_to_token_budget(
@@ -404,7 +432,20 @@ async def _generate_one_with_tools(args: argparse.Namespace, tokenizer: Any, pro
             if assistant_message is not None:
                 interaction_messages.append(assistant_message)
 
+            if args.debug_trace:
+                print(
+                    f"{debug_tag} turn={turn_index} TOOL-> elapsed={time.time() - trace_start:.1f}s",
+                    flush=True,
+                )
+            tool_t0 = time.time()
             next_obs, done, tool_message = await retool_runtime.execute_predictions(cur_response, tool_registry)
+            tool_dt = time.time() - tool_t0
+            if args.debug_trace:
+                print(
+                    f"{debug_tag} turn={turn_index} TOOL<- tool_s={tool_dt:.1f} "
+                    f"done={done} obs_chars={len(next_obs) if next_obs else 0}",
+                    flush=True,
+                )
             turn_record["done"] = done
             if done:
                 turns.append(turn_record)
@@ -527,13 +568,19 @@ def main() -> None:
 
                     async def _safe_generate(idx: int) -> dict[str, Any]:
                         async with semaphore:
+                            tag = f"[ex{index} s{idx}]"
+                            t0 = time.time()
                             try:
                                 return await asyncio.wait_for(
-                                    _generate_one_with_tools(args, tokenizer, prompt, retool_runtime),
+                                    _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, debug_tag=tag),
                                     timeout=args.sample_timeout,
                                 )
                             except asyncio.TimeoutError:
-                                print(f"[example {index} sample {idx}] timed out after {args.sample_timeout}s")
+                                print(
+                                    f"{tag} timed out after {args.sample_timeout}s "
+                                    f"(wall={time.time() - t0:.1f}s)",
+                                    flush=True,
+                                )
                                 return {
                                     "response": "",
                                     "turns": [],
