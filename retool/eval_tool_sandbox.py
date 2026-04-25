@@ -237,27 +237,6 @@ class PythonSandbox:
             except Exception:
                 pass
 
-    def _maybe_print_last_expr(self, code: str) -> str:
-        """If the last statement is a bare expression, rewrite it as print(repr(...))
-        so the value is visible in stdout (mimics Jupyter auto-display)."""
-        try:
-            tree = ast.parse(code)
-        except SyntaxError:
-            return code
-        if not tree.body:
-            return code
-        last = tree.body[-1]
-        if not isinstance(last, ast.Expr):
-            return code
-        # Splice in a print(repr(...)) in place of the bare expression.
-        lines = code.splitlines()
-        # ast gives 1-based line numbers
-        expr_start = last.lineno - 1
-        expr_end = last.end_lineno  # exclusive in slicing
-        expr_src = "\n".join(lines[expr_start:expr_end])
-        replacement = f"print(repr({expr_src}))"
-        return "\n".join(lines[:expr_start] + [replacement] + lines[expr_end:])
-
     async def execute_code(self, code: str) -> str:
         """Execute Python code in sandbox with safety checks"""
         # Check memory usage before execution
@@ -275,13 +254,9 @@ class PythonSandbox:
         combined_code = self.get_effective_code(code)
         default_import_block = self._build_default_import_block()
 
-        # Rewrite a trailing bare expression into print(repr(...)) so the value
-        # is captured in stdout (mirrors Jupyter's auto-display behaviour).
-        display_code = self._maybe_print_last_expr(code)
-
         # Replay prior successful code silently, then run only the new code with captured output.
         indented_previous_code = "\n".join("    " + line for line in previous_code.split("\n")) if previous_code else ""
-        indented_current_code = "\n".join("    " + line for line in display_code.split("\n"))
+        indented_current_code = "\n".join("    " + line for line in code.split("\n"))
 
         wrapped_code = f"""import sys
 import traceback
@@ -373,6 +348,8 @@ except Exception as e:
                     if process.returncode == 0:
                         result = stdout.strip()
                         self._successful_code = combined_code
+                        if not result:
+                            result = "Please use print() to output the result."
                     else:
                         result = f"Process exited with code {process.returncode}\n{stderr}"
                         if stdout.strip():
