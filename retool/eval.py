@@ -378,14 +378,22 @@ async def _generate_one_with_tools(
     trace_start = time.time()
     if args.debug_trace:
         print(f"{debug_tag} START backend={tool_registry.backend} session={tool_registry.session_id}", flush=True)
+    # Mutable progress tracker so a CancelledError (from outer wait_for timeout)
+    # can still report where we stalled.
+    progress: dict[str, Any] = {
+        "current_turn": -1,
+        "current_stage": "init",  # one of: init | gen | tool
+        "stage_started_at": trace_start,
+    }
+    interaction_messages: list[dict[str, Any]] = []
+    response_parts: list[str] = []
+    turns: list[dict[str, Any]] = []
+    tool_call_count = 0
+    total_trace_tokens = 0
+    stopped_due_to_max_tokens = False
+    timed_out = False
     try:
         tool_specs = tool_registry.get_tool_specs()
-        interaction_messages: list[dict[str, Any]] = []
-        response_parts: list[str] = []
-        turns: list[dict[str, Any]] = []
-        tool_call_count = 0
-        total_trace_tokens = 0
-        stopped_due_to_max_tokens = False
         max_turns = retool_runtime.TOOL_CONFIGS["max_turns"]
         max_tool_calls = retool_runtime.TOOL_CONFIGS["max_tool_calls"]
 
@@ -415,6 +423,9 @@ async def _generate_one_with_tools(
                     flush=True,
                 )
             gen_t0 = time.time()
+            progress["current_turn"] = turn_index
+            progress["current_stage"] = "gen"
+            progress["stage_started_at"] = gen_t0
             output = await _post_generate(args, payload)
             gen_dt = time.time() - gen_t0
             cur_response = retool_runtime.postprocess_responses(output["text"])
@@ -458,6 +469,8 @@ async def _generate_one_with_tools(
                     flush=True,
                 )
             tool_t0 = time.time()
+            progress["current_stage"] = "tool"
+            progress["stage_started_at"] = tool_t0
             next_obs, done, tool_message = await retool_runtime.execute_predictions(cur_response, tool_registry)
             tool_dt = time.time() - tool_t0
             if args.debug_trace:
@@ -503,17 +516,39 @@ async def _generate_one_with_tools(
             if tool_call_count >= max_tool_calls:
                 break
 
-        return {
-            "response": "".join(response_parts),
-            "turns": turns,
-            "tool_call_count": tool_call_count,
-            "tool_backend": tool_registry.backend,
-            "sandbox_session_id": tool_registry.session_id,
-            "total_trace_tokens": total_trace_tokens,
-            "stopped_due_to_max_tokens": stopped_due_to_max_tokens,
-        }
+    except asyncio.CancelledError:
+        # Outer wait_for is cancelling us due to sample_timeout. Don't re-raise:
+        # return partial state so the caller can log *where* the trace stalled.
+        timed_out = True
+        stage = progress.get("current_stage", "init")
+        stage_dt = time.time() - progress.get("stage_started_at", trace_start)
+        cur_turn = progress.get("current_turn", -1)
+        if debug_tag:
+            print(
+                f"{debug_tag} CANCELLED stage={stage} turn={cur_turn} "
+                f"stage_s={stage_dt:.1f} elapsed={time.time() - trace_start:.1f}s "
+                f"completed_turns={len(turns)} tool_calls={tool_call_count} "
+                f"trace_tokens={total_trace_tokens}",
+                flush=True,
+            )
     finally:
-        await tool_registry.close()
+        try:
+            await asyncio.shield(tool_registry.close())
+        except Exception:
+            pass
+
+    return {
+        "response": "".join(response_parts),
+        "turns": turns,
+        "tool_call_count": tool_call_count,
+        "tool_backend": tool_registry.backend,
+        "sandbox_session_id": "timeout" if timed_out else tool_registry.session_id,
+        "total_trace_tokens": total_trace_tokens,
+        "stopped_due_to_max_tokens": stopped_due_to_max_tokens,
+        "timed_out": timed_out,
+        "timeout_stage": progress.get("current_stage") if timed_out else None,
+        "timeout_turn": progress.get("current_turn") if timed_out else None,
+    }
 
 
 def _score_response(math_dapo_compute_score: Any, prompt: Any, label: str, response: str) -> dict[str, Any]:
@@ -633,13 +668,15 @@ def main() -> None:
                     tag = f"[ex{ex_index} s{sample_idx}]"
                     t0 = time.time()
                     try:
-                        return await asyncio.wait_for(
+                        result = await asyncio.wait_for(
                             _generate_one_with_tools(args, tokenizer, prompt, retool_runtime, debug_tag=tag),
                             timeout=args.sample_timeout,
                         )
                     except asyncio.TimeoutError:
+                        # Inner coroutine refused to honor cancellation in time.
+                        # This usually means a blocking I/O call we couldn't cancel.
                         print(
-                            f"{tag} SAMPLE-TIMEOUT after {args.sample_timeout}s "
+                            f"{tag} SAMPLE-TIMEOUT (hard) after {args.sample_timeout}s "
                             f"(wall={time.time() - t0:.1f}s)",
                             flush=True,
                         )
@@ -651,6 +688,9 @@ def main() -> None:
                             "sandbox_session_id": "timeout",
                             "total_trace_tokens": 0,
                             "stopped_due_to_max_tokens": False,
+                            "timed_out": True,
+                            "timeout_stage": "unknown",
+                            "timeout_turn": -1,
                         }
                     except Exception as exc:
                         print(
@@ -666,7 +706,22 @@ def main() -> None:
                             "sandbox_session_id": "error",
                             "total_trace_tokens": 0,
                             "stopped_due_to_max_tokens": False,
+                            "timed_out": True,
+                            "timeout_stage": "error",
+                            "timeout_turn": -1,
                         }
+                    if result.get("timed_out"):
+                        print(
+                            f"{tag} SAMPLE-TIMEOUT after {args.sample_timeout}s "
+                            f"(wall={time.time() - t0:.1f}s) "
+                            f"stage={result.get('timeout_stage')} "
+                            f"turn={result.get('timeout_turn')} "
+                            f"completed_turns={len(result.get('turns', []))} "
+                            f"tool_calls={result.get('tool_call_count', 0)} "
+                            f"trace_tokens={result.get('total_trace_tokens', 0)}",
+                            flush=True,
+                        )
+                    return result
 
             async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
                 nonlocal done_examples, num_correct, total_score, total_timeouts, examples_with_any_timeout
@@ -746,7 +801,12 @@ def main() -> None:
                     trace["sandbox_session_id"] = generation["sandbox_session_id"]
                     trace["total_trace_tokens"] = generation["total_trace_tokens"]
                     trace["stopped_due_to_max_tokens"] = generation["stopped_due_to_max_tokens"]
-                    trace["timed_out"] = generation["sandbox_session_id"] in ("timeout", "error")
+                    trace["timed_out"] = generation.get(
+                        "timed_out", generation["sandbox_session_id"] in ("timeout", "error")
+                    )
+                    if trace["timed_out"]:
+                        trace["timeout_stage"] = generation.get("timeout_stage")
+                        trace["timeout_turn"] = generation.get("timeout_turn")
                     new_traces.append(trace)
                     if args.print_turns:
                         _print_trace_turns(ex_index, trace)

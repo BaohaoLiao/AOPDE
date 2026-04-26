@@ -32,6 +32,13 @@ export USER="${USER:-user}"
 export LOGNAME="${LOGNAME:-$USER}"
 export HOME="${HOME:-/tmp}"
 
+# Bypass any corporate HTTP proxy for local sglang servers — otherwise
+# sglang's internal startup self-check (and curl below) routes
+# http://0.0.0.0:13141/model_info through the proxy, times out, and the
+# server process gets killed.
+export no_proxy="localhost,127.0.0.1,0.0.0.0,${no_proxy}"
+export NO_PROXY="localhost,127.0.0.1,0.0.0.0,${NO_PROXY}"
+
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
     HAS_NVLINK=1
@@ -78,12 +85,12 @@ CUDA_VISIBLE_DEVICES=${TEACHER_GPUS} python3 -m sglang.launch_server \
     > "${TEACHER_LOG}" 2>&1 &
 
 echo "Starting teacher model server..."
-until curl -sf http://${TEACHER_IP}:${TEACHER_PORT}/health_generate > /dev/null; do
+until curl -sf --noproxy '*' http://${TEACHER_IP}:${TEACHER_PORT}/health_generate > /dev/null; do
     echo "Waiting for teacher server..."
     tail -n 10 "${TEACHER_LOG}"
     sleep 5
 done
-curl http://${TEACHER_IP}:${TEACHER_PORT}/get_model_info
+curl --noproxy '*' http://${TEACHER_IP}:${TEACHER_PORT}/get_model_info
 echo "Teacher server is up at ${TEACHER_IP}:${TEACHER_PORT}."
 sleep 10
 
