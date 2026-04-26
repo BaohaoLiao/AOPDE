@@ -59,6 +59,35 @@ def _prompt_to_text(prompt: str | list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Shared aiohttp session per event loop. Creating a fresh ClientSession for
+# every reward call triggers a uvloop FD-reuse race ("File descriptor N is
+# used by transport"). Reusing one session per loop avoids that and is also
+# faster (HTTP keep-alive).
+# ---------------------------------------------------------------------------
+_session_lock = asyncio.Lock()
+_session_by_loop: "dict[int, aiohttp.ClientSession]" = {}
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sess = _session_by_loop.get(key)
+    if sess is not None and not sess.closed:
+        return sess
+    async with _session_lock:
+        sess = _session_by_loop.get(key)
+        if sess is not None and not sess.closed:
+            return sess
+        timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_connect=60)
+        connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        sess = aiohttp.ClientSession(
+            trust_env=False, timeout=timeout, connector=connector
+        )
+        _session_by_loop[key] = sess
+        return sess
+
+
+# ---------------------------------------------------------------------------
 # reward_func — called asynchronously once per sample during rollout
 # ---------------------------------------------------------------------------
 
@@ -81,15 +110,14 @@ async def reward_func(args, sample: Sample, **kwargs):
         "logprob_start_len": 0,
     }
 
-    timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_connect=60)
     last_err: Exception | None = None
     teacher_response = None
     for attempt in range(6):
         try:
-            async with aiohttp.ClientSession(trust_env=False, timeout=timeout) as session:
-                async with session.post(args.rm_url, json=payload) as resp:
-                    resp.raise_for_status()
-                    teacher_response = await resp.json()
+            session = await _get_session()
+            async with session.post(args.rm_url, json=payload) as resp:
+                resp.raise_for_status()
+                teacher_response = await resp.json()
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e
