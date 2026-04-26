@@ -20,6 +20,7 @@ reward.
 """
 from __future__ import annotations
 
+import asyncio
 import re
 
 import aiohttp
@@ -80,10 +81,24 @@ async def reward_func(args, sample: Sample, **kwargs):
         "logprob_start_len": 0,
     }
 
-    async with aiohttp.ClientSession(trust_env=False) as session:
-        async with session.post(args.rm_url, json=payload) as resp:
-            resp.raise_for_status()
-            teacher_response = await resp.json()
+    timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_connect=60)
+    last_err: Exception | None = None
+    teacher_response = None
+    for attempt in range(6):
+        try:
+            async with aiohttp.ClientSession(trust_env=False, timeout=timeout) as session:
+                async with session.post(args.rm_url, json=payload) as resp:
+                    resp.raise_for_status()
+                    teacher_response = await resp.json()
+            break
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_err = e
+            # Exponential backoff: 1, 2, 4, 8, 16, 32 s
+            await asyncio.sleep(min(2 ** attempt, 32))
+    else:
+        raise RuntimeError(
+            f"teacher /generate failed after retries (url={args.rm_url}): {last_err!r}"
+        )
 
     # 2. Math score — for monitoring only, NOT used as a reward
     solution_str = _prompt_to_text(sample.prompt) + sample.response
