@@ -151,13 +151,17 @@ def _load_tokenizer(tokenizer_path: str):
 
 
 def _load_math_dapo_compute_score():
+    """Return the oat boxed_reward_fn used to grade eval responses.
+
+    Name kept for backwards-compat with call sites; this now returns the
+    oat_math_grader grader (boxed extraction + math_equal), not math_dapo.
+    """
     try:
-        module = importlib.import_module("slime.rollout.rm_hub.math_dapo_utils")
-    except ImportError as exc:
-        raise ImportError(
-            f"Failed to import Slime math_dapo_utils from {SLIME_ROOT}. Check that the repo checkout is complete."
-        ) from exc
-    return module.compute_score
+        module = importlib.import_module("retool.oat_math_grader")
+    except ImportError:
+        # Fallback when running from inside the retool/ dir.
+        module = importlib.import_module("oat_math_grader")
+    return module.boxed_reward_fn
 
 
 def _load_retool_runtime():
@@ -478,16 +482,13 @@ async def _generate_one_with_tools(
     }
 
 
-def _score_response(math_dapo_compute_score: Any, prompt: Any, label: str, response: str) -> dict[str, Any]:
-    score_result = math_dapo_compute_score(
-        _prompt_to_text(prompt) + response,
-        label,
-        strict_box_verify=True,
-    )
+def _score_response(grader: Any, prompt: Any, label: str, response: str) -> dict[str, Any]:
+    info, score = grader(response, label, fast=False)
+    score = float(score)
     return {
-        "pred": score_result.get("pred"),
-        "score": float(score_result["score"]),
-        "acc": bool(score_result["acc"]),
+        "pred": info.get("pred") if isinstance(info, dict) else None,
+        "score": score,
+        "acc": score >= 1.0,
         "response": response,
     }
 

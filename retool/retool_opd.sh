@@ -85,7 +85,7 @@ CUDA_VISIBLE_DEVICES=${TEACHER_GPUS} \
     --port ${TEACHER_PORT} \
     --tp ${TEACHER_TP} \
     --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.85 \
+    --mem-fraction-static 0.9 \
     --max-running-requests 256 \
     --schedule-conservativeness 0.3 \
     --disable-radix-cache" \
@@ -255,6 +255,7 @@ ray job submit --address="http://127.0.0.1:8265" \
    ${OPTIMIZER_ARGS[@]} \
    ${GRPO_ARGS[@]} \
    ${OPD_ARGS[@]} \
+   ${CUSTOM_ARGS[@]} \
    ${TRAIN_ENV_ARGS[@]} \
    ${WANDB_ARGS[@]} \
    ${PERF_ARGS[@]} \
