@@ -29,10 +29,9 @@ import torch
 from slime.utils.types import Sample
 
 try:
-    from retool.oat_math_grader import boxed_reward_fn as oat_boxed_reward_fn
-except ImportError:
-    # Fallback when running from inside the retool/ dir.
-    from oat_math_grader import boxed_reward_fn as oat_boxed_reward_fn
+    from slime.rollout.rm_hub.math_dapo_utils import compute_score as math_dapo_compute_score
+except ImportError as e:
+    raise ImportError("math_dapo_utils is not installed") from e
 
 
 # ---------------------------------------------------------------------------
@@ -102,12 +101,13 @@ async def reward_func(args, sample: Sample, **kwargs):
         )
 
     # 2. Math score — for monitoring only, NOT used as a reward
+    solution_str = _prompt_to_text(sample.prompt) + sample.response
     ground_truth = sample.label if sample.label is not None else ""
-    _, task_score = oat_boxed_reward_fn(sample.response, ground_truth, fast=False)
+    result = math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=True)
 
     return {
         "teacher_response": teacher_response,
-        "task_score": float(task_score),
+        "task_score": result["score"],
     }
 
 
