@@ -3,11 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
-import shlex
 import socket
-import select
-import subprocess
 import sys
 import time
 import importlib
@@ -25,7 +21,12 @@ if str(SLIME_ROOT) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Launch or reuse an SGLang server and evaluate an HF model on zhuzilin/aime-2024.")
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate an HF model on AIME-2024 against an already-running SGLang server. "
+            "Start the server with retool/sglang_serve.sh first."
+        )
+    )
     parser.add_argument("-n", "--num-samples", type=int, default=1, help="Number of traces to sample per prompt")
     parser.add_argument(
         "--max-tokens",
@@ -38,7 +39,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print intermediate assistant/tool turns for each sampled trace",
     )
-    parser.add_argument("--model-path", required=True, help="HF model path for SGLang deployment")
+    parser.add_argument("--model-path", required=True, help="HF model path used to render chat templates / log in the summary")
     parser.add_argument(
         "--tokenizer-path",
         default=None,
@@ -48,29 +49,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="train", help="Dataset split to evaluate")
     parser.add_argument("--host", default="127.0.0.1", help="SGLang server host")
     parser.add_argument("--port", type=int, default=30000, help="SGLang server port")
-    parser.add_argument("--tp-size", type=int, default=1, help="Tensor parallel size for SGLang")
     parser.add_argument(
-        "--mem-fraction-static",
-        type=float,
-        default=0.7,
-        help="SGLang static memory fraction",
+        "--server-wait-timeout",
+        type=int,
+        default=60,
+        help="Seconds to wait for the SGLang server port to accept connections (default: 60).",
     )
-    parser.add_argument(
-        "--python-executable",
-        default=sys.executable,
-        help="Python executable used to launch SGLang",
-    )
-    parser.add_argument(
-        "--extra-server-args",
-        default="",
-        help="Extra arguments passed to `python -m sglang.launch_server`.",
-    )
-    parser.add_argument(
-        "--reuse-existing-server",
-        action="store_true",
-        help="Reuse an already-running SGLang server instead of launching one.",
-    )
-    parser.add_argument("--server-start-timeout", type=int, default=180, help="Seconds to wait for server startup")
     parser.add_argument("--request-timeout", type=int, default=1800, help="HTTP timeout per generation request")
     parser.add_argument("--max-new-tokens", type=int, default=8192, help="Max new tokens per sample")
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
@@ -274,81 +258,24 @@ def _post_json(url: str, payload: dict[str, Any], timeout: int) -> dict[str, Any
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _read_process_output(process: subprocess.Popen[str]) -> str:
-    if process.stdout is None:
-        return ""
-
-    chunks: list[str] = []
-    while True:
-        ready, _, _ = select.select([process.stdout], [], [], 0)
-        if not ready:
-            break
-        line = process.stdout.readline()
-        if line == "":
-            break
-        chunks.append(line)
-    return "".join(chunks)
+def _read_process_output(*_args: Any, **_kwargs: Any) -> str:  # pragma: no cover - retained for compat
+    return ""
 
 
-def _wait_for_port(host: str, port: int, timeout: int, process: subprocess.Popen[str] | None = None) -> None:
+def _wait_for_port(host: str, port: int, timeout: int) -> None:
+    """Wait for an externally-managed SGLang server to start accepting TCP connections."""
     deadline = time.time() + timeout
-    last_error = None
-    startup_output: list[str] = []
+    last_error: Exception | None = None
     while time.time() < deadline:
-        if process is not None:
-            output_chunk = _read_process_output(process)
-            if output_chunk:
-                startup_output.append(output_chunk)
-            return_code = process.poll()
-            if return_code is not None:
-                output_chunk = _read_process_output(process)
-                if output_chunk:
-                    startup_output.append(output_chunk)
-                combined_output = "".join(startup_output).strip()
-                detail = f"\nServer output:\n{combined_output}" if combined_output else ""
-                raise RuntimeError(f"SGLang server exited during startup with code {return_code}.{detail}")
         try:
             with socket.create_connection((host, port), timeout=2):
                 return
         except OSError as exc:
             last_error = exc
             time.sleep(1)
-    combined_output = "".join(startup_output).strip()
-    detail = f"\nServer output:\n{combined_output}" if combined_output else ""
-    raise TimeoutError(f"Timed out waiting for SGLang server on {host}:{port}: {last_error}{detail}")
-
-
-def _launch_server(args: argparse.Namespace) -> subprocess.Popen[str] | None:
-    if args.reuse_existing_server:
-        return None
-
-    command = [
-        args.python_executable,
-        "-m",
-        "sglang.launch_server",
-        "--model-path",
-        args.model_path,
-        "--host",
-        args.host,
-        "--port",
-        str(args.port),
-        "--tp-size",
-        str(args.tp_size),
-        "--mem-fraction-static",
-        str(args.mem_fraction_static),
-        "--trust-remote-code",
-    ]
-    command.extend(shlex.split(args.extra_server_args))
-
-    env = os.environ.copy()
-    print(f"Launching SGLang server: {' '.join(shlex.quote(part) for part in command)}")
-    return subprocess.Popen(
-        command,
-        env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+    raise TimeoutError(
+        f"Timed out waiting for SGLang server on {host}:{port} after {timeout}s. "
+        f"Is the server running? Last socket error: {last_error}"
     )
 
 
@@ -629,19 +556,13 @@ def main() -> None:
             output_path.replace(backup_path)
             print(f"[resume] backed up previous output to {backup_path}", flush=True)
 
-    server_process = _launch_server(args)
+    server_process = None
     try:
-        if server_process is None:
-            print(
-                f"Reusing existing SGLang server at http://{args.host}:{args.port}; "
-                f"waiting up to {args.server_start_timeout}s for it to accept connections."
-            )
-        else:
-            print(
-                f"Waiting for launched SGLang server at http://{args.host}:{args.port} "
-                f"for up to {args.server_start_timeout}s."
-            )
-        _wait_for_port(args.host, args.port, timeout=args.server_start_timeout, process=server_process)
+        print(
+            f"Connecting to SGLang server at http://{args.host}:{args.port} "
+            f"(waiting up to {args.server_wait_timeout}s for the port to accept connections)."
+        )
+        _wait_for_port(args.host, args.port, timeout=args.server_wait_timeout)
         print(f"SGLang server is reachable at http://{args.host}:{args.port}")
 
         async def _run_eval() -> dict[str, Any]:
@@ -908,12 +829,8 @@ def main() -> None:
             summary_path.write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
             print(f"Summary saved to {summary_path}")
     finally:
-        if server_process is not None:
-            server_process.terminate()
-            try:
-                server_process.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                server_process.kill()
+        # Externally-managed SGLang server: nothing to tear down here.
+        del server_process
 
 
 if __name__ == "__main__":
