@@ -23,6 +23,14 @@ pkill -9 python
 set -ex
 
 export PYTHONBUFFERED=16
+export TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor_cache
+
+# Some container UIDs (e.g. 19001) are not in /etc/passwd, which makes
+# getpass.getuser() -> pwd.getpwuid() raise KeyError inside torch._inductor.
+# Set USER/LOGNAME so getpass falls back to env vars instead of pwd lookup.
+export USER="${USER:-user}"
+export LOGNAME="${LOGNAME:-$USER}"
+export HOME="${HOME:-/tmp}"
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -213,7 +221,11 @@ RUNTIME_ENV_JSON="{
     \"HF_HUB_OFFLINE\": \"1\",
     \"TRANSFORMERS_OFFLINE\": \"1\",
     \"TOOL_SANDBOX_BACKEND\": \"${TOOL_SANDBOX_BACKEND}\",
-    \"TOOL_SANDBOX_JUPYTER_TIMEOUT\": \"${TOOL_SANDBOX_JUPYTER_TIMEOUT}\"
+    \"TOOL_SANDBOX_JUPYTER_TIMEOUT\": \"${TOOL_SANDBOX_JUPYTER_TIMEOUT}\",
+    \"TORCHINDUCTOR_CACHE_DIR\": \"${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_cache}\",
+    \"USER\": \"${USER}\",
+    \"LOGNAME\": \"${LOGNAME}\",
+    \"HOME\": \"${HOME}\"
   }
 }"
 
