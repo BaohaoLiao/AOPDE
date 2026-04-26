@@ -71,17 +71,24 @@ STUDENT_SAVE=${MODEL_DIR}/retool-opd/
 # ---------------------------------------------------------------------------
 # Start teacher SGLang server on dedicated GPUs
 # ---------------------------------------------------------------------------
-TEACHER_IP="127.0.0.1"
+# Use the node's routable IP, not 127.0.0.1 — Ray rollout workers may run on
+# other nodes and 127.0.0.1 on those nodes won't reach the teacher.
+TEACHER_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+TEACHER_IP="${TEACHER_IP:-127.0.0.1}"
 TEACHER_PORT=13141
 TEACHER_LOG="/tmp/sglang_teacher_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
-CUDA_VISIBLE_DEVICES=${TEACHER_GPUS} python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES=${TEACHER_GPUS} \
+    bash -c "cd /tmp && exec python3 -m sglang.launch_server \
     --model-path ${TEACHER_MODEL_PATH} \
     --host 0.0.0.0 \
     --port ${TEACHER_PORT} \
     --tp ${TEACHER_TP} \
-    --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.6 \
+    --chunked-prefill-size 2048 \
+    --mem-fraction-static 0.85 \
+    --max-running-requests 16 \
+    --schedule-conservativeness 0.3 \
+    --disable-radix-cache" \
     > "${TEACHER_LOG}" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -95,9 +102,9 @@ echo "Teacher server is up at ${TEACHER_IP}:${TEACHER_PORT}."
 sleep 10
 
 # ---------------------------------------------------------------------------
-# Student model architecture args (qwen3-4B)
+# Student model architecture args (qwen3-1.7B)
 # ---------------------------------------------------------------------------
-source "${SCRIPT_DIR}/../scripts/models/qwen3-4B.sh"
+source "${SCRIPT_DIR}/../scripts/models/qwen3-1.7B.sh"
 
 # ---------------------------------------------------------------------------
 # Training args
@@ -107,7 +114,7 @@ CKPT_ARGS=(
    --ref-load ${STUDENT_TORCH_DIST}
    --save ${STUDENT_SAVE}
    --save-interval 20
-   --rotary-base 5000000
+   --rotary-base 1000000
 )
 
 ROLLOUT_ARGS=(

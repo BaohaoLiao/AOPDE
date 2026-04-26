@@ -80,7 +80,7 @@ async def reward_func(args, sample: Sample, **kwargs):
         "logprob_start_len": 0,
     }
 
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(trust_env=False) as session:
         async with session.post(args.rm_url, json=payload) as resp:
             resp.raise_for_status()
             teacher_response = await resp.json()
