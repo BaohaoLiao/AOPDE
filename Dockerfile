@@ -173,10 +173,18 @@ FROM ${BASE_IMAGE}
 USER root
 
 # Additional apt packages Jupyter stacks need
+# Also upgrade libcap2/libcap2-bin to address CVE-2026-4878
 RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade \
+        libcap2 libcap2-bin && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         tini sudo locales fonts-dejavu tzdata bash-completion nano vim && \
     rm -rf /var/lib/apt/lists/*
+
+# Remove stray .git directories embedded in conda package test fixtures
+# (e.g. /opt/conda/etc/conda/test-files/referencing/1/suite/.git) which trip
+# repository scanners.
+RUN find /opt/conda -type d -name ".git" -prune -exec rm -rf {} + 2>/dev/null || true
 
 # Locale
 RUN sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen && locale-gen
@@ -221,6 +229,10 @@ RUN set -eux; \
         python3 -m pip install --no-cache-dir jupyterlab ipykernel ipywidgets jupyterlab_widgets && \
         python3 -m ipykernel install --sys-prefix --name python3 --display-name "Python 3"; \
     fi
+
+# Strip any .git directories pulled in by package test fixtures so security
+# scanners do not flag them (e.g. CVE name_match on /**/.git).
+RUN find /opt/conda /usr/local /usr/lib /usr/share -type d -name ".git" -prune -exec rm -rf {} + 2>/dev/null || true
 
 # Bring in Jupyter Docker Stacks helper scripts
 COPY --from=jupyter-scripts /usr/local/bin/start.sh              /usr/local/bin/start.sh

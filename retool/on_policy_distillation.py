@@ -128,15 +128,21 @@ async def reward_func(args, sample: Sample, **kwargs):
             f"teacher /generate failed after retries (url={args.rm_url}): {last_err!r}"
         )
 
-    # 2. Math score — for monitoring only, NOT used as a reward
+    # 2. Math score — used as the eval scalar reward and as a monitoring
+    # metric during training.
     solution_str = _prompt_to_text(sample.prompt) + sample.response
     ground_truth = sample.label if sample.label is not None else ""
     result = math_dapo_compute_score(solution_str, ground_truth, strict_box_verify=True)
+    task_score = float(result["score"])
 
-    return {
-        "teacher_response": teacher_response,
-        "task_score": result["score"],
-    }
+    # Stash the teacher /generate response on the sample for the
+    # post_process_rewards step. We can't return it via sample.reward because
+    # slime's eval path (`_log_eval_rollout_data`) does `sum(sample.reward)`,
+    # which requires a scalar.
+    sample._opd_teacher_response = teacher_response  # type: ignore[attr-defined]
+    sample._opd_task_score = task_score  # type: ignore[attr-defined]
+
+    return task_score
 
 
 # ---------------------------------------------------------------------------
@@ -160,12 +166,12 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     """
     response_lengths = [sample.response_length for sample in samples]
 
-    # Extract teacher log-probs from the SGLang response.
+    # Extract teacher log-probs from the SGLang response (stashed on sample by reward_func).
     # ``input_token_logprobs`` contains one entry per input token; we skip
     # the first element (the BOS / prompt-start position has no predecessor).
     teacher_log_probs = [
         torch.tensor(
-            [item[0] for item in sample.reward["teacher_response"]["meta_info"]["input_token_logprobs"][1:]],
+            [item[0] for item in sample._opd_teacher_response["meta_info"]["input_token_logprobs"][1:]],
             dtype=torch.float32,
         )
         for sample in samples
@@ -181,7 +187,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         sample.teacher_log_probs = t_log_probs
 
     # Log task score for monitoring (not used as reward)
-    task_scores = [sample.reward["task_score"] for sample in samples]
+    task_scores = [sample._opd_task_score for sample in samples]
     try:
         import wandb
         if wandb.run is not None:

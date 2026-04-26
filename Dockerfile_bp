@@ -161,4 +161,11 @@ import transformer_engine
 print(f"transformer_engine: {transformer_engine.__version__}")
 PY
 
+# ---------- Security patches (kept at the end so prior layers stay cached) ----------
+# CVE-2026-4878: libcap2 / libcap2-bin >= 1:2.44-1ubuntu0.22.04.3
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --allow-change-held-packages \
+      libcap2 libcap2-bin && \
+    rm -rf /var/lib/apt/lists/*
+
 CMD ["/bin/bash"]
