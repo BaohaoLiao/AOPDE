@@ -666,6 +666,24 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response = final_response
     sample.loss_mask = final_loss_masks
     sample.rollout_log_probs = final_rollout_log_probs
+    # If the sample was aborted before any output_token_logprobs were
+    # returned (e.g. SGLang abort on the very first turn), rollout_log_probs
+    # may still be None even though response_length > 0 (from prior turns).
+    # Slime's _convert_samples_to_train_data only checks samples[0] for
+    # None-ness, so a single None entry later in the batch becomes
+    # `len(None)` in slice_log_prob_with_cp. Substitute zeros to keep the
+    # batch trainable; loss_mask already zeros out unobserved tokens where
+    # appropriate.
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = [0.0] * sample.response_length
+    elif len(sample.rollout_log_probs) != sample.response_length:
+        # Pad/truncate to response_length so downstream length asserts hold.
+        if len(sample.rollout_log_probs) < sample.response_length:
+            sample.rollout_log_probs = sample.rollout_log_probs + [0.0] * (
+                sample.response_length - len(sample.rollout_log_probs)
+            )
+        else:
+            sample.rollout_log_probs = sample.rollout_log_probs[: sample.response_length]
     if final_was_clipped:
         sample.status = Sample.Status.TRUNCATED
 

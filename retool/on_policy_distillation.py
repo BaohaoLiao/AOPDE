@@ -242,7 +242,20 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             [item[0] for item in resp["meta_info"]["input_token_logprobs"][1:]],
             dtype=torch.float32,
         )
-        teacher_log_probs.append(full[-response_length:])
+        # Guard against the Python slicing quirk where ``full[-0:]`` returns
+        # the full tensor instead of an empty one. We need exactly
+        # ``response_length`` log-probs (or zeros if the teacher returned
+        # fewer than expected).
+        if response_length == 0:
+            sliced = full[:0]
+        else:
+            sliced = full[-response_length:]
+        if sliced.numel() != response_length:
+            # Pad with zeros at the front if the teacher returned fewer
+            # tokens than the student's response length.
+            pad = torch.zeros(response_length - sliced.numel(), dtype=torch.float32)
+            sliced = torch.cat([pad, sliced])
+        teacher_log_probs.append(sliced)
 
     if n_failed:
         import sys
@@ -256,8 +269,10 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
         sample.teacher_log_probs = t_log_probs
 
-    # Log task score for monitoring (not used as reward)
-    task_scores = [sample._opd_task_score for sample in samples]
+    # Log task score for monitoring (not used as reward). Aborted samples
+    # bypass reward_func entirely (see sglang_rollout.generate_and_rm) so the
+    # ``_opd_task_score`` attribute may be missing; fall back to 0.0.
+    task_scores = [getattr(sample, "_opd_task_score", 0.0) for sample in samples]
     try:
         import wandb
         if wandb.run is not None:
