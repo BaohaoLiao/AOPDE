@@ -684,6 +684,29 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             )
         else:
             sample.rollout_log_probs = sample.rollout_log_probs[: sample.response_length]
+
+    # Guarantee response_length >= 1. A zero-length response (e.g. SGLang
+    # aborted before any token was generated, or max_turns=1 with the
+    # context budget already exhausted) propagates an empty entry into
+    # slime's dynamic-batch partitioner and ultimately produces an empty
+    # micro-batch -> `torch.cat([])` in get_batch. Pad with a single dummy
+    # token whose loss_mask=0 so gradients/KL are unaffected but every
+    # micro-batch contains at least one token tensor.
+    if sample.response_length == 0:
+        pad_token_id = (
+            state.tokenizer.pad_token_id
+            if state.tokenizer.pad_token_id is not None
+            else (state.tokenizer.eos_token_id or 0)
+        )
+        sample.tokens = list(sample.tokens) + [pad_token_id]
+        sample.response = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
+        sample.response_length = 1
+        sample.loss_mask = [0]
+        sample.rollout_log_probs = [0.0]
+        # An empty response is by definition not a successful completion.
+        if sample.status not in {Sample.Status.ABORTED, Sample.Status.TRUNCATED}:
+            sample.status = Sample.Status.TRUNCATED
+
     if final_was_clipped:
         sample.status = Sample.Status.TRUNCATED
 
