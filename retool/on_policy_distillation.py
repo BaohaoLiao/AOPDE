@@ -73,7 +73,7 @@ _semaphore_by_loop: "dict[int, asyncio.Semaphore]" = {}
 _TEACHER_MAX_INFLIGHT = 64
 _TEACHER_REQUEST_TIMEOUT = 600  # seconds; per-attempt aiohttp timeout
 _TEACHER_TOTAL_BUDGET = 900     # seconds; total wall-clock budget for the whole reward_func call (across all retries)
-_TEACHER_MAX_RETRIES = 3        # cap retries so a stuck sample can't burn hours
+_TEACHER_MAX_RETRIES = 2        # cap retries so a stuck sample can't burn hours
 
 
 def _get_semaphore() -> asyncio.Semaphore:

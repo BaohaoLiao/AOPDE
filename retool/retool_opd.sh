@@ -138,7 +138,7 @@ ROLLOUT_ARGS=(
 # Custom generate uses retool tool execution; OPD reward gets teacher log-probs
 # and logs math_dapo score for monitoring (not used as reward).
 CUSTOM_ARGS=(
-   --custom-generate-function-path generate_with_retool.generate
+   --custom-generate-function-path opd_generate_with_retool.generate
    --custom-rm-path retool.on_policy_distillation.reward_func
    --custom-reward-post-process-path retool.on_policy_distillation.post_process_rewards
    --rm-url http://${TEACHER_IP}:${TEACHER_PORT}/generate
