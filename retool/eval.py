@@ -117,6 +117,27 @@ def _load_dataset_records(args: argparse.Namespace):
     return dataset
 
 
+# DAPO-style math instruction wrapper. Applied to eval prompts that don't
+# already contain it, so the model sees the same prompt format as during
+# SFT/RL training.
+DAPO_PROMPT_PREFIX = (
+    "Solve the following math problem step by step. The last line of your "
+    "response should be of the form Answer: \\boxed{$Answer} where $Answer "
+    "is the answer to the problem.\n\n"
+)
+DAPO_PROMPT_SUFFIX = "\n\nRemember to put your answer on its own line after \"Answer:\"."
+
+
+def _ensure_dapo_wrap(text: str) -> str:
+    """Prepend/append the DAPO math instruction strings if missing."""
+    out = text
+    if "Solve the following math problem step by step" not in out:
+        out = DAPO_PROMPT_PREFIX + out
+    if "Remember to put your answer on its own line after" not in out:
+        out = out + DAPO_PROMPT_SUFFIX
+    return out
+
+
 def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
     if isinstance(prompt, str):
         return prompt
@@ -647,7 +668,7 @@ def main() -> None:
 
             async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
                 nonlocal done_examples, num_correct, total_score, total_timeouts, examples_with_any_timeout
-                prompt = row["problem"]
+                prompt = _ensure_dapo_wrap(row["problem"])
                 label = str(row.get("gt", ""))
 
                 # Resume logic: figure out which sample indices need to be (re)run

@@ -199,8 +199,12 @@ WANDB_ARGS=(
    --wandb-key ${WANDB_KEY}
 )
 
+# Don't force NVTE_*_ATTN here. Megatron's `auto` attention backend asserts
+# that any pre-set NVTE_{FLASH,FUSED,UNFUSED}_ATTN matches its expected
+# values; passing explicit 0/1 mismatches and crashes init. Leave them unset
+# (or use --attention-backend to pin a specific backend).
 TRAIN_ENV_ARGS=(
-   --train-env-vars "{\"NVTE_FLASH_ATTN\":\"${NVTE_FLASH_ATTN:-1}\",\"NVTE_FUSED_ATTN\":\"${NVTE_FUSED_ATTN:-1}\",\"NVTE_UNFUSED_ATTN\":\"${NVTE_UNFUSED_ATTN:-0}\",\"NVTE_DEBUG\":\"${NVTE_DEBUG:-0}\",\"NVTE_DEBUG_LEVEL\":\"${NVTE_DEBUG_LEVEL:-0}\"}"
+   --train-env-vars "{\"NVTE_DEBUG\":\"${NVTE_DEBUG:-0}\",\"NVTE_DEBUG_LEVEL\":\"${NVTE_DEBUG_LEVEL:-0}\"}"
 )
 
 SGLANG_ARGS=(
