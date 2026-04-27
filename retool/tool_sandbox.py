@@ -325,33 +325,45 @@ except Exception as e:
             with open(script_path, "w") as f:
                 f.write(wrapped_code)
 
-            try:
-                # Use subprocess to run code
-                process = subprocess.Popen(
-                    ["python3", script_path],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    env=env,
-                    cwd=temp_dir,
-                    text=True,
-                )
-
-                # Set timeout
+            def _run_subprocess() -> str:
+                """Synchronous subprocess runner — must NOT touch the asyncio
+                loop. Called via asyncio.to_thread so the blocking
+                Popen/communicate/kill sequence runs on a worker thread and
+                doesn't stall (or, with uvloop, abort) the event-loop thread.
+                """
                 try:
-                    stdout, stderr = process.communicate(timeout=self.timeout)
+                    process = subprocess.Popen(
+                        ["python3", script_path],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        env=env,
+                        cwd=temp_dir,
+                        text=True,
+                    )
+                    try:
+                        stdout, stderr = process.communicate(timeout=self.timeout)
+                        if process.returncode == 0:
+                            return ("ok", stdout.strip())
+                        else:
+                            err = f"Process exited with code {process.returncode}\n{stderr}"
+                            if stdout.strip():
+                                err = stdout.strip()
+                            return ("err", err)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        try:
+                            process.communicate(timeout=5)
+                        except Exception:
+                            pass
+                        return ("err", f"Code execution timed out after {self.timeout} seconds")
+                except Exception as e:
+                    return ("err", f"Failed to execute code: {str(e)}")
 
-                    if process.returncode == 0:
-                        result = stdout.strip()
-                        self._successful_code = combined_code
-                    else:
-                        result = f"Process exited with code {process.returncode}\n{stderr}"
-                        if stdout.strip():
-                            result = stdout.strip()
-
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    result = f"Code execution timed out after {self.timeout} seconds"
-
+            try:
+                kind, payload = await asyncio.to_thread(_run_subprocess)
+                if kind == "ok":
+                    self._successful_code = combined_code
+                result = payload
             except Exception as e:
                 result = f"Failed to execute code: {str(e)}"
 

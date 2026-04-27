@@ -1,5 +1,10 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
 import asyncio
+# IMPORTANT: install the stdlib asyncio loop policy BEFORE slime's
+# AsyncLoopThread creates its event loop. uvloop + concurrent subprocess.Popen
+# in tool_sandbox + many aiohttp sockets reliably triggers a SIGABRT in the
+# event-loop thread under load. The stdlib selector loop is slower but stable.
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 import json
 import os
 import re
