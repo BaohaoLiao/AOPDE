@@ -70,7 +70,7 @@ _session_by_loop: "dict[int, aiohttp.ClientSession]" = {}
 # teacher SGLang server has a finite max-running-requests; firing hundreds of
 # parallel logprob requests pushes them onto a queue and they time out.
 _semaphore_by_loop: "dict[int, asyncio.Semaphore]" = {}
-_TEACHER_MAX_INFLIGHT = 32
+_TEACHER_MAX_INFLIGHT = 128
 _TEACHER_REQUEST_TIMEOUT = 600  # seconds; per-attempt aiohttp timeout
 _TEACHER_TOTAL_BUDGET = 900     # seconds; total wall-clock budget for the whole reward_func call (across all retries)
 _TEACHER_MAX_RETRIES = 3        # cap retries so a stuck sample can't burn hours
@@ -103,8 +103,8 @@ async def _get_session() -> aiohttp.ClientSession:
         # uvloop FD-reuse race ("File descriptor N is used by transport") under
         # heavy parallel rollouts.
         connector = aiohttp.TCPConnector(
-            limit=128,
-            limit_per_host=128,
+            limit=256,
+            limit_per_host=256,
             ttl_dns_cache=300,
             force_close=False,
             enable_cleanup_closed=True,
