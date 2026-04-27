@@ -79,7 +79,16 @@ async def _get_session() -> aiohttp.ClientSession:
         if sess is not None and not sess.closed:
             return sess
         timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_connect=60)
-        connector = aiohttp.TCPConnector(limit=0, ttl_dns_cache=300)
+        # Bound concurrent sockets. limit=0 (unbounded) reliably triggers a
+        # uvloop FD-reuse race ("File descriptor N is used by transport") under
+        # heavy parallel rollouts.
+        connector = aiohttp.TCPConnector(
+            limit=128,
+            limit_per_host=128,
+            ttl_dns_cache=300,
+            force_close=False,
+            enable_cleanup_closed=True,
+        )
         sess = aiohttp.ClientSession(
             trust_env=False, timeout=timeout, connector=connector
         )
@@ -112,7 +121,7 @@ async def reward_func(args, sample: Sample, **kwargs):
 
     last_err: Exception | None = None
     teacher_response = None
-    for attempt in range(6):
+    for attempt in range(8):
         try:
             session = await _get_session()
             async with session.post(args.rm_url, json=payload) as resp:
@@ -123,6 +132,15 @@ async def reward_func(args, sample: Sample, **kwargs):
             last_err = e
             # Exponential backoff: 1, 2, 4, 8, 16, 32 s
             await asyncio.sleep(min(2 ** attempt, 32))
+        except RuntimeError as e:
+            # uvloop "File descriptor N is used by transport" race during
+            # connection setup. Brief jittered backoff lets uvloop clean up
+            # its transport bookkeeping before we retry.
+            msg = str(e)
+            if "File descriptor" not in msg and "transport" not in msg:
+                raise
+            last_err = e
+            await asyncio.sleep(0.05 * (attempt + 1))
     else:
         raise RuntimeError(
             f"teacher /generate failed after retries (url={args.rm_url}): {last_err!r}"
