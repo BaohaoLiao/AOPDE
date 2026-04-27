@@ -66,6 +66,22 @@ def _prompt_to_text(prompt: str | list) -> str:
 # ---------------------------------------------------------------------------
 _session_lock = asyncio.Lock()
 _session_by_loop: "dict[int, aiohttp.ClientSession]" = {}
+# Per-loop semaphore that bounds in-flight teacher /generate requests. The
+# teacher SGLang server has a finite max-running-requests; firing hundreds of
+# parallel logprob requests pushes them onto a queue and they time out.
+_semaphore_by_loop: "dict[int, asyncio.Semaphore]" = {}
+_TEACHER_MAX_INFLIGHT = 32
+_TEACHER_REQUEST_TIMEOUT = 1800  # seconds; long inputs can take a while when queued
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    sem = _semaphore_by_loop.get(key)
+    if sem is None:
+        sem = asyncio.Semaphore(_TEACHER_MAX_INFLIGHT)
+        _semaphore_by_loop[key] = sem
+    return sem
 
 
 async def _get_session() -> aiohttp.ClientSession:
@@ -78,7 +94,9 @@ async def _get_session() -> aiohttp.ClientSession:
         sess = _session_by_loop.get(key)
         if sess is not None and not sess.closed:
             return sess
-        timeout = aiohttp.ClientTimeout(total=600, connect=60, sock_connect=60)
+        timeout = aiohttp.ClientTimeout(
+            total=_TEACHER_REQUEST_TIMEOUT, connect=60, sock_connect=60
+        )
         # Bound concurrent sockets. limit=0 (unbounded) reliably triggers a
         # uvloop FD-reuse race ("File descriptor N is used by transport") under
         # heavy parallel rollouts.
@@ -121,12 +139,14 @@ async def reward_func(args, sample: Sample, **kwargs):
 
     last_err: Exception | None = None
     teacher_response = None
+    sem = _get_semaphore()
     for attempt in range(8):
         try:
             session = await _get_session()
-            async with session.post(args.rm_url, json=payload) as resp:
-                resp.raise_for_status()
-                teacher_response = await resp.json()
+            async with sem:
+                async with session.post(args.rm_url, json=payload) as resp:
+                    resp.raise_for_status()
+                    teacher_response = await resp.json()
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e

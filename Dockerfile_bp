@@ -163,9 +163,18 @@ PY
 
 # ---------- Security patches (kept at the end so prior layers stay cached) ----------
 # CVE-2026-4878: libcap2 / libcap2-bin >= 1:2.44-1ubuntu0.22.04.3
-RUN apt-get update && \
+# The base image's apt sources were rewritten to mirrors.edge.kernel.org which
+# does not serve the *-security pocket, so add the official Ubuntu security
+# archive just for this layer, then remove it again.
+RUN set -eux; \
+    . /etc/os-release; \
+    echo "deb http://security.ubuntu.com/ubuntu ${UBUNTU_CODENAME}-security main restricted universe multiverse" \
+      > /etc/apt/sources.list.d/ubuntu-security-cve.list; \
+    apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --only-upgrade --allow-change-held-packages \
-      libcap2 libcap2-bin && \
+      libcap2 libcap2-bin; \
+    dpkg -s libcap2 | grep -E '^Version:'; \
+    rm -f /etc/apt/sources.list.d/ubuntu-security-cve.list; \
     rm -rf /var/lib/apt/lists/*
 
 CMD ["/bin/bash"]

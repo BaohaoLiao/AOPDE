@@ -27,8 +27,8 @@ except ImportError:
 
 # Configuration for tool execution
 TOOL_CONFIGS = {
-    "max_turns": 16,
-    "max_tool_calls": 16,
+    "max_turns": int(os.environ.get("TOOL_SANDBOX_MAX_TURNS", "16")),
+    "max_tool_calls": int(os.environ.get("TOOL_SANDBOX_MAX_TOOL_CALLS", "16")),
     "tool_concurrency": int(os.environ.get("TOOL_SANDBOX_CONCURRENCY", "32")),
     "sandbox_backend": os.environ.get("TOOL_SANDBOX_BACKEND", "subprocess").lower(),
     # Python interpreter settings

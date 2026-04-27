@@ -594,6 +594,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             break
 
+        # Skip tool execution entirely when tools are disabled. This makes
+        # max_tool_calls=0 a true "no tools" mode (single-shot completion).
+        if TOOL_CONFIGS["max_tool_calls"] <= 0:
+            break
+
         next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
         if done:
             break
