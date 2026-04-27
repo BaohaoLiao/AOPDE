@@ -229,8 +229,17 @@ export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
 export TOOL_SANDBOX_BACKEND=${TOOL_SANDBOX_BACKEND:-"subprocess"}
 export TOOL_SANDBOX_CONCURRENCY=${TOOL_SANDBOX_CONCURRENCY:-"32"}
 export TOOL_SANDBOX_JUPYTER_TIMEOUT=${TOOL_SANDBOX_JUPYTER_TIMEOUT:-"300"}
-export TOOL_SANDBOX_MAX_TURNS=${TOOL_SANDBOX_MAX_TURNS:-"1"}
-export TOOL_SANDBOX_MAX_TOOL_CALLS=${TOOL_SANDBOX_MAX_TOOL_CALLS:-"0"}
+export TOOL_SANDBOX_MAX_TURNS=${TOOL_SANDBOX_MAX_TURNS:-"16"}
+export TOOL_SANDBOX_MAX_TOOL_CALLS=${TOOL_SANDBOX_MAX_TOOL_CALLS:-"16"}
+
+# Raise file-descriptor and process limits. Defaults of 1024/4096 in many
+# containers will get exhausted by 32+ tool subprocesses (each holds 6+ fds)
+# combined with 64+ aiohttp sockets to the teacher and 256+ to the student
+# router. FD exhaustion in uvloop manifests as a SIGABRT in the asyncio loop
+# thread.
+ulimit -n 1048576 2>/dev/null || ulimit -n 65536 2>/dev/null || true
+ulimit -u 65536 2>/dev/null || true
+echo "[opd] ulimit -n=$(ulimit -n)  ulimit -u=$(ulimit -u)"
 
 ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
