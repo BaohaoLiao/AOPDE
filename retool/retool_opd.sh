@@ -84,10 +84,11 @@ CUDA_VISIBLE_DEVICES=${TEACHER_GPUS} \
     --host 0.0.0.0 \
     --port ${TEACHER_PORT} \
     --tp ${TEACHER_TP} \
-    --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.9 \
-    --max-running-requests 256 \
-    --schedule-conservativeness 0.3 \
+    --chunked-prefill-size 2048 \
+    --mem-fraction-static 0.80 \
+    --max-running-requests 32 \
+    --max-total-tokens 65536 \
+    --schedule-conservativeness 0.5 \
     --disable-radix-cache" \
     > "${TEACHER_LOG}" 2>&1 &
 

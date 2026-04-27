@@ -71,7 +71,9 @@ _session_by_loop: "dict[int, aiohttp.ClientSession]" = {}
 # parallel logprob requests pushes them onto a queue and they time out.
 _semaphore_by_loop: "dict[int, asyncio.Semaphore]" = {}
 _TEACHER_MAX_INFLIGHT = 32
-_TEACHER_REQUEST_TIMEOUT = 1800  # seconds; long inputs can take a while when queued
+_TEACHER_REQUEST_TIMEOUT = 600  # seconds; per-attempt aiohttp timeout
+_TEACHER_TOTAL_BUDGET = 900     # seconds; total wall-clock budget for the whole reward_func call (across all retries)
+_TEACHER_MAX_RETRIES = 3        # cap retries so a stuck sample can't burn hours
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -95,7 +97,7 @@ async def _get_session() -> aiohttp.ClientSession:
         if sess is not None and not sess.closed:
             return sess
         timeout = aiohttp.ClientTimeout(
-            total=_TEACHER_REQUEST_TIMEOUT, connect=60, sock_connect=60
+            total=_TEACHER_REQUEST_TIMEOUT, connect=60, sock_connect=60, sock_read=300
         )
         # Bound concurrent sockets. limit=0 (unbounded) reliably triggers a
         # uvloop FD-reuse race ("File descriptor N is used by transport") under
@@ -140,7 +142,12 @@ async def reward_func(args, sample: Sample, **kwargs):
     last_err: Exception | None = None
     teacher_response = None
     sem = _get_semaphore()
-    for attempt in range(8):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _TEACHER_TOTAL_BUDGET
+    for attempt in range(_TEACHER_MAX_RETRIES):
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
         try:
             session = await _get_session()
             async with sem:
@@ -150,8 +157,8 @@ async def reward_func(args, sample: Sample, **kwargs):
             break
         except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_err = e
-            # Exponential backoff: 1, 2, 4, 8, 16, 32 s
-            await asyncio.sleep(min(2 ** attempt, 32))
+            # Exponential backoff: 1, 2, 4 s
+            await asyncio.sleep(min(2 ** attempt, 8))
         except RuntimeError as e:
             # uvloop "File descriptor N is used by transport" race during
             # connection setup. Brief jittered backoff lets uvloop clean up
@@ -161,10 +168,22 @@ async def reward_func(args, sample: Sample, **kwargs):
                 raise
             last_err = e
             await asyncio.sleep(0.05 * (attempt + 1))
-    else:
-        raise RuntimeError(
-            f"teacher /generate failed after retries (url={args.rm_url}): {last_err!r}"
+
+    if teacher_response is None:
+        # Give up gracefully: log and stash a zero-logprob sentinel so the
+        # batch can complete. post_process_rewards will replace these with
+        # zeros of the right length.
+        import sys
+        print(
+            f"[opd] WARN: teacher /generate failed for sample after "
+            f"{_TEACHER_MAX_RETRIES} retries (url={args.rm_url}, "
+            f"prompt_tokens={len(sample.tokens)}): {last_err!r}",
+            file=sys.stderr,
+            flush=True,
         )
+        sample._opd_teacher_response = None  # type: ignore[attr-defined]
+        sample._opd_task_score = 0.0  # type: ignore[attr-defined]
+        return 0.0
 
     # 2. Math score — used as the eval scalar reward and as a monitoring
     # metric during training.
@@ -207,19 +226,32 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     # Extract teacher log-probs from the SGLang response (stashed on sample by reward_func).
     # ``input_token_logprobs`` contains one entry per input token; we skip
     # the first element (the BOS / prompt-start position has no predecessor).
-    teacher_log_probs = [
-        torch.tensor(
-            [item[0] for item in sample._opd_teacher_response["meta_info"]["input_token_logprobs"][1:]],
+    # If the teacher request failed (sentinel = None), substitute zeros so the
+    # rest of the batch still trains; the sample's contribution to the KL
+    # penalty will be ~0 (student logp - 0). This is far better than failing
+    # the whole rollout cycle for a few stuck samples.
+    teacher_log_probs = []
+    n_failed = 0
+    for sample, response_length in zip(samples, response_lengths, strict=False):
+        resp = getattr(sample, "_opd_teacher_response", None)
+        if resp is None:
+            n_failed += 1
+            teacher_log_probs.append(torch.zeros(response_length, dtype=torch.float32))
+            continue
+        full = torch.tensor(
+            [item[0] for item in resp["meta_info"]["input_token_logprobs"][1:]],
             dtype=torch.float32,
         )
-        for sample in samples
-    ]
+        teacher_log_probs.append(full[-response_length:])
 
-    # Trim to the response span: last response_length tokens.
-    teacher_log_probs = [
-        t_log_prob[-response_length:]
-        for t_log_prob, response_length in zip(teacher_log_probs, response_lengths, strict=False)
-    ]
+    if n_failed:
+        import sys
+        print(
+            f"[opd] WARN: {n_failed}/{len(samples)} samples had no teacher "
+            f"logprobs; substituted zeros.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     for sample, t_log_probs in zip(samples, teacher_log_probs, strict=False):
         sample.teacher_log_probs = t_log_probs
