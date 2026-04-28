@@ -56,7 +56,17 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to wait for the SGLang server port to accept connections (default: 60).",
     )
     parser.add_argument("--request-timeout", type=int, default=1800, help="HTTP timeout per generation request")
-    parser.add_argument("--max-new-tokens", type=int, default=8192, help="Max new tokens per sample")
+    parser.add_argument("--max-new-tokens", type=int, default=16384, help="Max new tokens per sample")
+    parser.add_argument(
+        "--max-context-len",
+        type=int,
+        default=16384,
+        help=(
+            "Hard cap on input_tokens + max_new_tokens per /generate call. Must match the SGLang "
+            "server's --context-length (default 16384). Each turn shrinks max_new_tokens to "
+            "max_context_len - len(input_ids) - 16, breaking the trace if no room remains."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.0, help="Sampling temperature")
     parser.add_argument("--top-p", type=float, default=1.0, help="Sampling top-p")
     parser.add_argument("--limit", type=int, default=None, help="Evaluate only the first N examples")
@@ -360,12 +370,26 @@ async def _generate_one_with_tools(
                 messages=interaction_messages,
             )
             input_ids = tokenizer(rendered_prompt, add_special_tokens=False)["input_ids"]
+            # Cap max_new_tokens to fit inside the server's context window. SGLang
+            # rejects requests where len(input_ids) + max_new_tokens > context_length
+            # with HTTP 400 "Requested token count exceeds the model's maximum context length".
+            context_budget = max(0, args.max_context_len - len(input_ids) - 16)
+            turn_max_new = min(args.max_new_tokens, context_budget)
+            if turn_max_new <= 0:
+                if args.debug_trace:
+                    print(
+                        f"{debug_tag} turn={turn_index} CONTEXT-FULL input_tokens={len(input_ids)} "
+                        f"max_context_len={args.max_context_len} — stopping trace",
+                        flush=True,
+                    )
+                stopped_due_to_max_tokens = True
+                break
             payload = {
                 "input_ids": input_ids,
                 "sampling_params": {
                     "temperature": args.temperature,
                     "top_p": args.top_p,
-                    "max_new_tokens": args.max_new_tokens,
+                    "max_new_tokens": turn_max_new,
                 },
             }
             if args.debug_trace:
