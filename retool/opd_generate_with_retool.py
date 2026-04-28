@@ -508,49 +508,118 @@ async def execute_predictions(
 
 
 # ---------------------------------------------------------------------------
-# Mixed forward/reverse-KL helpers (Stage 1: trailing assistant only)
+# Mixed forward/reverse-KL helpers
+#
+# Strategy: when RETOOL_OPD_MIX_PROMPT_ASSISTANT=1, redefine the prompt /
+# response cut so that EVERY assistant token from sample.prompt is part of
+# the trainable response span (with loss_mask=OPD_SFT_LOSS_MASK=2 -> forward
+# KL / SFT). The prompt becomes just the system+tools header. The on-policy
+# rollout still runs from the trailing "<|im_start|>assistant" position and
+# its generated tokens get loss_mask=1 (reverse-KL) as usual.
+#
+# Slime's loss kernel only computes loss over the trailing response_length
+# tokens of each sample, so by enlarging response_length to cover all
+# sample.prompt messages we get the SFT signal on every in-prompt assistant
+# token (not just trailing ones) WITHOUT having to plumb full-sequence masks
+# through actor.forward, log_prob slicing, advantage computation, and the
+# policy loss reduction.
 # ---------------------------------------------------------------------------
 
-def _split_trailing_assistant(
-    prompt_messages: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Pop trailing assistant messages off ``prompt_messages``.
-
-    Returns ``(prefix_messages, trailing_assistant_messages)``. The split is
-    purely structural; both parts may be empty.
-    """
-    prefix = list(prompt_messages)
-    trailing: list[dict[str, Any]] = []
-    while prefix and prefix[-1].get("role") == "assistant":
-        trailing.insert(0, prefix.pop())
-    return prefix, trailing
-
-
-def _render_assistant_extension_text(trailing_messages: list[dict[str, Any]]) -> str:
-    """Render trailing assistant message(s) as the suffix that follows
-    ``<|im_start|>assistant`` in the chat template.
-
-    The prefix prompt rendering already ends with ``<|im_start|>assistant``
-    (no trailing newline), and message parts are joined by ``\\n`` in
-    ``format_conversation_with_tools``. So the SFT extension begins with a
-    leading ``\\n`` and ends with the final ``<|im_end|>``. For multiple
-    trailing assistant turns we insert ``\\n<|im_start|>assistant\\n``
-    between them, mirroring the chat template exactly.
-    """
-    out_parts: list[str] = []
-    for i, msg in enumerate(trailing_messages):
-        body_parts = [msg.get("content", "") or ""]
+def _render_message_with_separator(msg: dict[str, Any]) -> str:
+    """Render a single chat message as the text fragment that follows the
+    "\\n" separator inside ``format_conversation_with_tools``. Returned text
+    INCLUDES the leading ``\\n``."""
+    role = msg.get("role", "user")
+    content = msg.get("content", "") or ""
+    if role == "system":
+        return f"\n<|im_start|>system\n{content}<|im_end|>"
+    if role == "user":
+        return f"\n<|im_start|>user\n{content}<|im_end|>"
+    if role == "assistant":
+        parts = ["<|im_start|>assistant", content]
         for tool_call in msg.get("tool_calls", []) or []:
-            body_parts.append("<tool_call>")
-            body_parts.append(json.dumps(tool_call["function"], ensure_ascii=False))
-            body_parts.append("</tool_call>")
-        body_parts.append("<|im_end|>")
-        rendered_body = "\n".join(part for part in body_parts if part != "")
-        if i == 0:
-            out_parts.append("\n" + rendered_body)
-        else:
-            out_parts.append("\n<|im_start|>assistant\n" + rendered_body)
-    return "".join(out_parts)
+            parts.append("<tool_call>")
+            parts.append(json.dumps(tool_call["function"], ensure_ascii=False))
+            parts.append("</tool_call>")
+        parts.append("<|im_end|>")
+        body = "\n".join(p for p in parts if p != "")
+        return "\n" + body
+    if role == "tool":
+        return (
+            "\n<|im_start|>user\n"
+            "<tool_response>\n"
+            f"{content}\n"
+            "</tool_response><|im_end|>"
+        )
+    return ""
+
+
+def _build_mixed_loss_seed(
+    tokenizer,
+    sample_prompt: Any,
+    tool_specs: list[dict[str, Any]],
+    full_system_prompt: str,
+) -> tuple[list[int], list[int], list[int], bool, list[dict[str, Any]]] | None:
+    """Compute (prompt_ids, seed_response_ids, seed_loss_masks,
+    ends_with_assistant, normalized_messages) for the mixed-loss seeding path.
+
+    Returns None if the incremental tokenization does not exactly reproduce
+    the whole-prompt tokenization (BPE merges across boundaries, custom
+    chat-template quirks, etc). Caller falls back to the standard path.
+    """
+    normalized_messages = _normalize_prompt_messages(sample_prompt)
+    if not normalized_messages:
+        return None
+
+    # System+tools header (no trailing assistant header, no messages).
+    system_text = f"<|im_start|>system\n{full_system_prompt}<|im_end|>"
+    prompt_ids: list[int] = list(tokenizer(system_text, add_special_tokens=False)["input_ids"])
+
+    seed_token_ids: list[int] = []
+    seed_loss_masks: list[int] = []
+    for msg in normalized_messages:
+        seg_text = _render_message_with_separator(msg)
+        if not seg_text:
+            continue
+        seg_ids = list(tokenizer(seg_text, add_special_tokens=False)["input_ids"])
+        if not seg_ids:
+            continue
+        mask_val = OPD_SFT_LOSS_MASK if msg.get("role") == "assistant" else 0
+        seed_token_ids += seg_ids
+        seed_loss_masks += [mask_val] * len(seg_ids)
+
+    ends_with_assistant = normalized_messages[-1].get("role") == "assistant"
+
+    # Append the trailing "<|im_start|>assistant" generation header UNLESS the
+    # last message was already assistant (in which case we have no rollout and
+    # closing the conversation cleanly is correct).
+    if not ends_with_assistant:
+        trailing_text = "\n<|im_start|>assistant"
+        trailing_ids = list(tokenizer(trailing_text, add_special_tokens=False)["input_ids"])
+        seed_token_ids += trailing_ids
+        seed_loss_masks += [0] * len(trailing_ids)
+
+    # Parity check: incremental tokenization must equal whole-string
+    # tokenization, otherwise loss_mask alignment is off and we silently
+    # corrupt training. Fall back to the standard path on mismatch.
+    if ends_with_assistant:
+        # _render_recorded_messages renders messages without appending a
+        # trailing assistant header — exact match for our seeded tokens.
+        full_text = system_text + "\n" + _render_recorded_messages(normalized_messages)
+    else:
+        full_text = format_conversation_with_tools(prompt=sample_prompt, tools=tool_specs)
+    expected_ids = list(tokenizer(full_text, add_special_tokens=False)["input_ids"])
+    actual_ids = prompt_ids + seed_token_ids
+    if expected_ids != actual_ids:
+        print(
+            f"[opd-mix] WARN: incremental tokenization parity check FAILED "
+            f"(expected {len(expected_ids)} tokens, got {len(actual_ids)}); "
+            f"falling back to standard rollout (no SFT seeding) for this sample.",
+            flush=True,
+        )
+        return None
+
+    return prompt_ids, seed_token_ids, seed_loss_masks, ends_with_assistant, normalized_messages
 
 
 async def generate(args, sample: Sample, sampling_params) -> Sample:
@@ -565,41 +634,54 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
 
-    # Mixed forward/reverse-KL: when enabled, pop trailing assistant turns
-    # from sample.prompt and treat them as a pre-filled rollout response with
-    # loss_mask=2 (forward-KL / SFT). Pure-rollout samples (no trailing
-    # assistant) are unaffected. We DO NOT mutate sample.prompt because the
-    # reward function and downstream logging rely on the original.
-    sft_seed_messages: list[dict[str, Any]] = []
-    sft_seed_token_ids: list[int] = []
-    effective_prompt: Any = sample.prompt
-    if _OPD_MIX_PROMPT_ASSISTANT:
-        normalized_prompt_messages = _normalize_prompt_messages(sample.prompt)
-        prefix_messages, sft_seed_messages = _split_trailing_assistant(normalized_prompt_messages)
-        if sft_seed_messages:
-            effective_prompt = prefix_messages
-
-    prompt = format_conversation_with_tools(prompt=effective_prompt, tools=tool_specs)
-    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-
-    # If we have trailing-assistant SFT seed messages, tokenize them as the
-    # text continuation that follows `<|im_start|>assistant` (the prefix
-    # rendering already ends with that header). These tokens become the
-    # initial response with loss_mask=OPD_SFT_LOSS_MASK.
-    if sft_seed_messages:
-        sft_extension_text = _render_assistant_extension_text(sft_seed_messages)
-        sft_seed_token_ids = state.tokenizer(sft_extension_text, add_special_tokens=False)["input_ids"]
-        print(
-            f"[opd-mix] sample_start sft_messages={len(sft_seed_messages)} "
-            f"sft_tokens={len(sft_seed_token_ids)}",
-            flush=True,
-        )
-    # Build recorded_messages with the full system prompt (including tool descriptions)
-    # so that payload_text faithfully reflects what the model actually sees.
+    # Build the full system prompt text once; we need it both for tokenizing
+    # the system+tools prefix in the mixed-loss path, and for recorded_messages.
     full_system_prompt = DEFAULT_SYSTEM_PROMPT
     if tool_specs:
         tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tool_specs)
         full_system_prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+
+    # Mixed forward/reverse-KL: when enabled, EVERY assistant token in
+    # sample.prompt becomes a forward-KL (SFT) target. We achieve this by
+    # cutting prompt = system+tools only, and seeding the response with all
+    # sample.prompt messages (assistant tokens -> mask 2, user/tool tokens ->
+    # mask 0) plus the trailing assistant generation header.
+    sft_seed_token_ids: list[int] = []
+    sft_seed_loss_masks: list[int] = []
+    sft_skip_rollout = False  # set True if sample.prompt ends with assistant
+    sft_normalized_messages: list[dict[str, Any]] | None = None
+    used_mixed_loss_seed = False
+    if _OPD_MIX_PROMPT_ASSISTANT:
+        seed_result = _build_mixed_loss_seed(
+            tokenizer=state.tokenizer,
+            sample_prompt=sample.prompt,
+            tool_specs=tool_specs,
+            full_system_prompt=full_system_prompt,
+        )
+        if seed_result is not None:
+            (
+                _prompt_ids_only,
+                sft_seed_token_ids,
+                sft_seed_loss_masks,
+                ends_with_assistant,
+                sft_normalized_messages,
+            ) = seed_result
+            prompt_tokens_ids = _prompt_ids_only
+            sft_skip_rollout = ends_with_assistant
+            used_mixed_loss_seed = True
+            n_sft = sum(1 for m in sft_seed_loss_masks if m == OPD_SFT_LOSS_MASK)
+            print(
+                f"[opd-mix] sample_start prompt_ids={len(prompt_tokens_ids)} "
+                f"seed_ids={len(sft_seed_token_ids)} sft_tokens={n_sft} "
+                f"ends_with_assistant={ends_with_assistant}",
+                flush=True,
+            )
+
+    if not used_mixed_loss_seed:
+        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+        prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    # Build recorded_messages with the full system prompt (including tool descriptions)
+    # so that payload_text faithfully reflects what the model actually sees.
     recorded_messages = _build_initial_recorded_messages(sample.prompt, system_prompt=full_system_prompt)
     interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
@@ -626,29 +708,44 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     last_finish_reason = None
 
-    # Seed the response with SFT (forward-KL) tokens, if any. We also seed
-    # interaction_messages so subsequent rollout turns (when the loop runs)
-    # see the demonstration as conversation history. rollout_log_probs gets
-    # zeros at SFT positions; the actor's own forward pass produces the
-    # "old" log-probs for those positions during training, so DO NOT enable
-    # --use-rollout-logprobs when using mixed loss.
-    if sft_seed_token_ids:
+    # Seed the response with the in-prompt SFT (forward-KL) tokens, if the
+    # mixed-loss path is active. rollout_log_probs gets zeros at SFT positions;
+    # the actor's own forward pass produces the "old" log-probs for those
+    # positions during training, so DO NOT enable --use-rollout-logprobs when
+    # using mixed loss.
+    if used_mixed_loss_seed and sft_seed_token_ids:
         sft_extension_decoded = state.tokenizer.decode(sft_seed_token_ids, skip_special_tokens=False)
         response += sft_extension_decoded
         response_token_ids += list(sft_seed_token_ids)
-        loss_masks += [OPD_SFT_LOSS_MASK] * len(sft_seed_token_ids)
+        loss_masks += list(sft_seed_loss_masks)
         if sample.rollout_log_probs is None:
             sample.rollout_log_probs = []
         sample.rollout_log_probs += [0.0] * len(sft_seed_token_ids)
-        for msg in sft_seed_messages:
-            interaction_messages.append(msg)
+        # The rollout loop renders sample.prompt + interaction_messages every
+        # turn; sample.prompt already contains all the in-prompt messages, so
+        # interaction_messages stays empty here. But populate recorded_messages
+        # so debug logging reflects the seeded chat history (these messages
+        # are already part of sample.prompt — _build_initial_recorded_messages
+        # only added system, so we extend with sample.prompt's messages).
+        for msg in sft_normalized_messages or []:
             recorded_messages.append(msg)
         sample.messages = list(recorded_messages)
 
     async def _run_turns():
         nonlocal response, response_token_ids, loss_masks, tool_call_count, last_finish_reason
+        # In the mixed-loss path, when sample.prompt ends with an assistant
+        # turn, the seeded response IS the entire trainable signal for this
+        # sample (pure SFT). Skipping the rollout avoids asking SGLang to
+        # generate "another" assistant turn after a closed conversation.
+        if sft_skip_rollout:
+            print(
+                f"[opd-mix] sample ends with assistant; skipping rollout "
+                f"(SFT-only sample, response_tokens={len(response_token_ids)})",
+                flush=True,
+            )
+            return
         for turn in range(TOOL_CONFIGS["max_turns"]):
-            prompt = format_conversation_with_tools(prompt=effective_prompt, tools=tool_specs, messages=interaction_messages)
+            prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
             current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
             # Check if total length exceeds max context length
