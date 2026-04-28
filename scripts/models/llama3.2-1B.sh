@@ -1,8 +1,8 @@
 MODEL_ARGS=(
    --swiglu
-   --num-layers 32
-   --hidden-size 4096
-   --ffn-hidden-size 14336
+   --num-layers 16
+   --hidden-size 2048
+   --ffn-hidden-size 8192
    --num-attention-heads 32
    --group-query-attention
    --num-query-groups 8
@@ -15,6 +15,5 @@ MODEL_ARGS=(
    --vocab-size 128256
    --kv-channels 128
    --use-rope-scaling
-   --rotary-scaling-factor 8.0
-   --untie-embeddings-and-output-weights
+   --rotary-scaling-factor 32.0
 )
