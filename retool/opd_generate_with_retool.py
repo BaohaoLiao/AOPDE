@@ -29,6 +29,29 @@ from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
 # via the GENERATE_SAMPLE_TIMEOUT env var (seconds).
 _SAMPLE_TIMEOUT = float(os.environ.get("GENERATE_SAMPLE_TIMEOUT", "600"))
 
+# ---------------------------------------------------------------------------
+# OPD mixed-loss support
+#
+# When RETOOL_OPD_MIX_PROMPT_ASSISTANT=1, any assistant turn(s) at the end of
+# sample.prompt are popped off the prompt and treated as the rollout response
+# with loss_mask=OPD_SFT_LOSS_MASK (=2). Slime's OPD kernel then applies a
+# forward-KL (≡ SFT) gradient at those positions instead of reverse-KL.
+#
+# Mask convention (consumed by slime's apply_opd_kl_to_advantages):
+#     0  →  ignored (tool observations, padding)
+#     1  →  reverse KL (student-rollout assistant tokens)
+#     2  →  forward KL / SFT (in-prompt assistant demonstration tokens)
+#
+# Stage 1 limitation: only TRAILING assistant turns are supported. Mid-prompt
+# assistant turns (assistant followed by user/tool) sit inside the prompt span
+# that slime's loss kernel discards; supporting them requires plumbing a
+# full-sequence mask through actor.forward, log_prob slicing, advantage
+# computation, and the policy-loss reduction — see Stage 2 design notes in
+# the change description.
+# ---------------------------------------------------------------------------
+OPD_SFT_LOSS_MASK = 2
+_OPD_MIX_PROMPT_ASSISTANT = os.environ.get("RETOOL_OPD_MIX_PROMPT_ASSISTANT", "0") == "1"
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
     "tools to solve mathematical problems. When you need "
@@ -484,10 +507,55 @@ async def execute_predictions(
     return next_obs, done, tool_message
 
 
+# ---------------------------------------------------------------------------
+# Mixed forward/reverse-KL helpers (Stage 1: trailing assistant only)
+# ---------------------------------------------------------------------------
+
+def _split_trailing_assistant(
+    prompt_messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Pop trailing assistant messages off ``prompt_messages``.
+
+    Returns ``(prefix_messages, trailing_assistant_messages)``. The split is
+    purely structural; both parts may be empty.
+    """
+    prefix = list(prompt_messages)
+    trailing: list[dict[str, Any]] = []
+    while prefix and prefix[-1].get("role") == "assistant":
+        trailing.insert(0, prefix.pop())
+    return prefix, trailing
+
+
+def _render_assistant_extension_text(trailing_messages: list[dict[str, Any]]) -> str:
+    """Render trailing assistant message(s) as the suffix that follows
+    ``<|im_start|>assistant`` in the chat template.
+
+    The prefix prompt rendering already ends with ``<|im_start|>assistant``
+    (no trailing newline), and message parts are joined by ``\\n`` in
+    ``format_conversation_with_tools``. So the SFT extension begins with a
+    leading ``\\n`` and ends with the final ``<|im_end|>``. For multiple
+    trailing assistant turns we insert ``\\n<|im_start|>assistant\\n``
+    between them, mirroring the chat template exactly.
+    """
+    out_parts: list[str] = []
+    for i, msg in enumerate(trailing_messages):
+        body_parts = [msg.get("content", "") or ""]
+        for tool_call in msg.get("tool_calls", []) or []:
+            body_parts.append("<tool_call>")
+            body_parts.append(json.dumps(tool_call["function"], ensure_ascii=False))
+            body_parts.append("</tool_call>")
+        body_parts.append("<|im_end|>")
+        rendered_body = "\n".join(part for part in body_parts if part != "")
+        if i == 0:
+            out_parts.append("\n" + rendered_body)
+        else:
+            out_parts.append("\n<|im_start|>assistant\n" + rendered_body)
+    return "".join(out_parts)
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
-
     state = GenerateState(args)
     tool_registry = ToolRegistry()
     sandbox_session_id = tool_registry.session_id
@@ -496,8 +564,36 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+
+    # Mixed forward/reverse-KL: when enabled, pop trailing assistant turns
+    # from sample.prompt and treat them as a pre-filled rollout response with
+    # loss_mask=2 (forward-KL / SFT). Pure-rollout samples (no trailing
+    # assistant) are unaffected. We DO NOT mutate sample.prompt because the
+    # reward function and downstream logging rely on the original.
+    sft_seed_messages: list[dict[str, Any]] = []
+    sft_seed_token_ids: list[int] = []
+    effective_prompt: Any = sample.prompt
+    if _OPD_MIX_PROMPT_ASSISTANT:
+        normalized_prompt_messages = _normalize_prompt_messages(sample.prompt)
+        prefix_messages, sft_seed_messages = _split_trailing_assistant(normalized_prompt_messages)
+        if sft_seed_messages:
+            effective_prompt = prefix_messages
+
+    prompt = format_conversation_with_tools(prompt=effective_prompt, tools=tool_specs)
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+
+    # If we have trailing-assistant SFT seed messages, tokenize them as the
+    # text continuation that follows `<|im_start|>assistant` (the prefix
+    # rendering already ends with that header). These tokens become the
+    # initial response with loss_mask=OPD_SFT_LOSS_MASK.
+    if sft_seed_messages:
+        sft_extension_text = _render_assistant_extension_text(sft_seed_messages)
+        sft_seed_token_ids = state.tokenizer(sft_extension_text, add_special_tokens=False)["input_ids"]
+        print(
+            f"[opd-mix] sample_start sft_messages={len(sft_seed_messages)} "
+            f"sft_tokens={len(sft_seed_token_ids)}",
+            flush=True,
+        )
     # Build recorded_messages with the full system prompt (including tool descriptions)
     # so that payload_text faithfully reflects what the model actually sees.
     full_system_prompt = DEFAULT_SYSTEM_PROMPT
@@ -530,10 +626,29 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     last_finish_reason = None
 
+    # Seed the response with SFT (forward-KL) tokens, if any. We also seed
+    # interaction_messages so subsequent rollout turns (when the loop runs)
+    # see the demonstration as conversation history. rollout_log_probs gets
+    # zeros at SFT positions; the actor's own forward pass produces the
+    # "old" log-probs for those positions during training, so DO NOT enable
+    # --use-rollout-logprobs when using mixed loss.
+    if sft_seed_token_ids:
+        sft_extension_decoded = state.tokenizer.decode(sft_seed_token_ids, skip_special_tokens=False)
+        response += sft_extension_decoded
+        response_token_ids += list(sft_seed_token_ids)
+        loss_masks += [OPD_SFT_LOSS_MASK] * len(sft_seed_token_ids)
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = []
+        sample.rollout_log_probs += [0.0] * len(sft_seed_token_ids)
+        for msg in sft_seed_messages:
+            interaction_messages.append(msg)
+            recorded_messages.append(msg)
+        sample.messages = list(recorded_messages)
+
     async def _run_turns():
         nonlocal response, response_token_ids, loss_masks, tool_call_count, last_finish_reason
         for turn in range(TOOL_CONFIGS["max_turns"]):
-            prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
+            prompt = format_conversation_with_tools(prompt=effective_prompt, tools=tool_specs, messages=interaction_messages)
             current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
             # Check if total length exceeds max context length
