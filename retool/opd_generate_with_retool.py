@@ -52,6 +52,51 @@ _SAMPLE_TIMEOUT = float(os.environ.get("GENERATE_SAMPLE_TIMEOUT", "600"))
 OPD_SFT_LOSS_MASK = 2
 _OPD_MIX_PROMPT_ASSISTANT = os.environ.get("RETOOL_OPD_MIX_PROMPT_ASSISTANT", "0") == "1"
 
+# ---------------------------------------------------------------------------
+# OPD per-turn reverse-KL weighting (mean-1 normalization)
+#
+# Each teacher trace of K assistant turns is fanned out at data-prep time
+# into K sub-prompts (turn k = student generates turn k given turns 1..k-1
+# as prefix, k is 0-indexed). Earlier turns explore more (less-conditioned),
+# later turns are more constrained — we want stronger reverse-KL signal on
+# earlier turns.
+#
+# The dataset must provide two metadata fields per sample:
+#     "assistant_turn_index"   : k, 0-indexed (0 = first assistant turn)
+#     "total_assistant_turns"  : K (>= 1)
+#
+# Weight schedule:  raw r_k = alpha^k    (k = 0..K-1, alpha in (0,1])
+# Normalization:    w_k = K * r_k / sum_j r_j
+# Properties:
+#   * mean(w_k over k=0..K-1) = 1  -> opd_kl_coef keeps its semantics
+#   * w_0 > w_1 > ... > w_{K-1} > 0  (early turns boosted, late dampened)
+#   * alpha = 1.0 disables the schedule (all weights = 1)
+# Override alpha via env var RETOOL_OPD_REV_TURN_DECAY (default 0.8).
+# ---------------------------------------------------------------------------
+_OPD_REV_TURN_DECAY_ALPHA = float(os.environ.get("RETOOL_OPD_REV_TURN_DECAY", "0.8"))
+
+
+def _compute_normalized_turn_weight(k: int, K: int, alpha: float) -> float:
+    """Mean-1 normalized exponential decay weight for sample at turn k of K total.
+
+    Args:
+        k: 0-indexed turn that the student is generating (0 = first turn).
+        K: total number of assistant turns in the original teacher trace.
+        alpha: decay base in (0, 1]. 1.0 disables decay.
+
+    Returns:
+        Per-sample reverse-KL multiplier w_k. Mean over k=0..K-1 equals 1.0.
+    """
+    if K <= 1 or alpha >= 1.0:
+        return 1.0
+    if alpha <= 0.0:
+        # Degenerate: only turn 0 is trained.
+        return float(K) if k == 0 else 0.0
+    # raw_k = alpha^k for k in [0, K-1]
+    raw = [alpha ** j for j in range(K)]
+    total = sum(raw)
+    return K * raw[k] / total
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
     "tools to solve mathematical problems. When you need "
@@ -966,6 +1011,28 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     if sample.metadata is None:
         sample.metadata = {}
     sample.metadata["round_number"] = tool_call_count
+
+    # OPD per-turn reverse-KL weight. Computed here (not at data-prep) so the
+    # alpha hyper-parameter can be tuned via env var without re-baking the
+    # dataset. Requires the dataset to provide "assistant_turn_index" (0-indexed)
+    # and "total_assistant_turns" in sample.metadata. If either is missing we
+    # fall back to weight = 1.0 (feature inactive for that sample).
+    _k_raw = sample.metadata.get("assistant_turn_index")
+    _K_raw = sample.metadata.get("total_assistant_turns")
+    if _k_raw is not None and _K_raw is not None:
+        try:
+            _k = int(_k_raw)
+            _K = int(_K_raw)
+            if _K >= 1 and 0 <= _k < _K:
+                sample.metadata["opd_rev_kl_weight"] = _compute_normalized_turn_weight(
+                    _k, _K, _OPD_REV_TURN_DECAY_ALPHA
+                )
+            else:
+                sample.metadata["opd_rev_kl_weight"] = 1.0
+        except (TypeError, ValueError):
+            sample.metadata["opd_rev_kl_weight"] = 1.0
+    else:
+        sample.metadata["opd_rev_kl_weight"] = 1.0
 
     # Set status
     if sample.status not in {Sample.Status.TRUNCATED, Sample.Status.ABORTED}:
