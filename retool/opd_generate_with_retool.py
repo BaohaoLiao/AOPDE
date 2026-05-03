@@ -457,9 +457,19 @@ def postprocess_predictions(prediction: str):
         tool_name = tool_call_data.get("name")
         arguments = tool_call_data.get("arguments", {})
 
+        # Some models emit arguments as a JSON-encoded string (OpenAI-style)
+        # rather than a dict. Decode defensively before .get().
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
         if tool_name == "code_interpreter":
             code = arguments.get("code", "")
-            if code.strip():
+            if isinstance(code, str) and code.strip():
                 return "code", code
 
     # Then check for <code> tags
