@@ -1,21 +1,21 @@
-"""On-policy distillation (OPD) reward functions WITH math+tool_call shaping.
+"""On-policy distillation (OPD) reward functions — pure OPD with reward LOGGING.
 
-This is a v2 variant of ``on_policy_distillation.py`` that returns a non-zero
-scalar reward (math correctness + tool-call shaping) to the advantage
-estimator IN ADDITION to the OPD reverse-KL signal. Use this when you want
-mixed RL+OPD training instead of pure distillation.
+This is a v3 variant of ``on_policy_distillation.py``. Behaviorally identical
+to v1 (returns ``0.0`` reward per sample so training is *pure* distillation
+driven only by the OPD reverse-KL signal), but additionally logs the math
+task score, the would-be v2-style shaped reward, and the per-sample
+tool-call count to wandb so you can monitor reward dynamics without using
+them as the training signal.
 
 Wire it in your launch script:
-   --custom-rm-path retool.on_policy_distillation_v2.reward_func
-   --custom-reward-post-process-path retool.on_policy_distillation_v2.post_process_rewards
+   --custom-rm-path retool.on_policy_distillation_v3.reward_func
+   --custom-reward-post-process-path retool.on_policy_distillation_v3.post_process_rewards
 
-The original ``on_policy_distillation.py`` is left untouched for runs that
-want pure distillation (reward = 0).
-
-Reward formula (mirrors ``generate_with_retool.reward_func``):
-   - +1.0 when the math answer is correct
-   - otherwise ``min(-0.6, base_negative + (num_turns - 2) / 2 * 0.1)``
-   The OPD reverse-KL is applied on top by ``apply_opd_kl_to_advantages``.
+Logged metrics (per rollout):
+   rollout/student_task_score      — mean math_dapo score (+1 / -1)
+   rollout/shaped_reward_mean      — mean of v2-style shaped reward (NOT used)
+   rollout/tool_call_count_mean    — mean number of tool calls per sample
+   rollout/student_correct_rate    — fraction of samples with task_score > 0
 """
 
 from __future__ import annotations
@@ -33,20 +33,12 @@ from retool.on_policy_distillation import reward_func  # noqa: F401
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
-    """Extract teacher log-probs AND return shaped scalar reward.
+    """Extract teacher log-probs, log monitoring metrics, return zero rewards.
 
     Stores token-level teacher log-probs in ``sample.teacher_log_probs``
     (trimmed to the response span) for OPD reverse-KL computation. Returns
-    a math + tool-call shaped reward per sample (mirrors
-    ``generate_with_retool.reward_func``):
-      - +1.0 when the answer is correct
-      - otherwise ``min(-0.6, base_negative + (num_turns - 2)/2 * 0.1)``
-    The OPD reverse-KL penalty is applied on top of this reward by
-    ``apply_opd_kl_to_advantages``.
-
-    Note: ``sample.response_length`` spans model-generated tokens **and**
-    tool-observation tokens. Observation tokens have ``loss_mask=0`` so
-    their KL penalty contribution is zeroed out in the final training loss.
+    ``[0.0] * N`` so the advantage estimator contributes nothing — pure OPD.
+    The shaped reward and task score are logged for monitoring only.
     """
     response_lengths = [sample.response_length for sample in samples]
 
@@ -78,7 +70,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
 
     if n_failed:
         print(
-            f"[opd-v2] WARN: {n_failed}/{len(samples)} samples had no teacher "
+            f"[opd-v3] WARN: {n_failed}/{len(samples)} samples had no teacher "
             f"logprobs; substituted zeros.",
             file=sys.stderr,
             flush=True,
@@ -88,38 +80,49 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         sample.teacher_log_probs = t_log_probs
 
     # ------------------------------------------------------------------
-    # 2. Math + tool-call shaping reward (NEW in v2).
-    #    - +1.0 when correct
-    #    - min(-0.6, base + (num_turns - 2)/2 * 0.1) when wrong
+    # 2. Compute monitoring metrics (NOT used as reward).
     # ------------------------------------------------------------------
-    scalar_rewards: list[float] = []
     task_scores: list[float] = []
     tool_call_counts: list[int] = []
+    shaped_rewards: list[float] = []
     for sample in samples:
         task_score = float(getattr(sample, "_opd_task_score", 0.0) or 0.0)
         num_turns = int(getattr(sample, "tool_call_count", 0) or 0)
         task_scores.append(task_score)
         tool_call_counts.append(num_turns)
 
-        score = task_score
-        if score < 0:
+        # v2-style shaped reward, computed for logging only.
+        shaped = task_score
+        if shaped < 0:
             tool_call_reward = (num_turns - 2) / 2 * 0.1
-            score = min(-0.6, score + tool_call_reward)
-        scalar_rewards.append(score)
+            shaped = min(-0.6, shaped + tool_call_reward)
+        shaped_rewards.append(shaped)
+
+    n = max(1, len(samples))
+    correct_rate = sum(1 for s in task_scores if s > 0) / n
 
     try:
         import wandb
         if wandb.run is not None:
             wandb.log(
                 {
-                    "rollout/student_task_score": sum(task_scores) / len(task_scores),
-                    "rollout/shaped_reward_mean": sum(scalar_rewards) / len(scalar_rewards),
-                    "rollout/tool_call_count_mean": sum(tool_call_counts) / max(1, len(tool_call_counts)),
+                    "rollout/student_task_score": sum(task_scores) / n,
+                    "rollout/shaped_reward_mean": sum(shaped_rewards) / n,
+                    "rollout/tool_call_count_mean": sum(tool_call_counts) / n,
+                    "rollout/student_correct_rate": correct_rate,
                 }
             )
     except ImportError:
         pass
 
-    scalar_rewards = [0.0] * len(samples)
+    print(
+        f"[opd-v3] task_score_mean={sum(task_scores) / n:.3f} "
+        f"correct_rate={correct_rate:.3f} "
+        f"tool_calls_mean={sum(tool_call_counts) / n:.2f} "
+        f"shaped_mean={sum(shaped_rewards) / n:.3f}",
+        flush=True,
+    )
 
-    return scalar_rewards, scalar_rewards
+    # Pure OPD: zero scalar reward — only the reverse-KL signal trains.
+    zero_rewards = [0.0] * len(samples)
+    return zero_rewards, zero_rewards
