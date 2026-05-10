@@ -23,53 +23,109 @@ DEFAULT_SYSTEM_PROMPT = (
     "tool to execute code and get results."
 )
 
+TOOL_SYSTEM_PROMPT = """# Tools
 
-def _build_chat_messages(
-    prompt: str | list[dict[str, Any]],
-    system_prompt: str = None,
-    messages: list[dict[str, Any]] = None,
-) -> list[dict[str, Any]]:
-    """Assemble structured chat messages used by the tokenizer chat template."""
-    chat_messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT}
-    ]
-    chat_messages.extend(_normalize_prompt_messages(prompt))
-    if messages:
-        chat_messages.extend(
-            message for message in messages if _should_keep_message(message)
-        )
-    return chat_messages
+You may call one function at a time to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+__TOOLS__
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
+After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>"""
 
 
 def format_conversation_with_tools(
-    tokenizer,
     prompt: str | list[dict[str, Any]],
     tools: list[dict[str, Any]] = None,
     system_prompt: str = None,
     messages: list[dict[str, Any]] = None,
 ) -> str:
-    """Format conversation via tokenizer.apply_chat_template (tools handled by template)."""
-    chat_messages = _build_chat_messages(prompt, system_prompt=system_prompt, messages=messages)
-    return tokenizer.apply_chat_template(
-        chat_messages,
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    """Format conversation using a static system prompt and explicit message rendering."""
+
+    # Prepare messages
+    messages_to_render = []
+
+    # Always add system message - use provided one or default
+    if system_prompt:
+        system_content = system_prompt
+    else:
+        system_content = DEFAULT_SYSTEM_PROMPT
+
+    if tools:
+        tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tools)
+        system_content = f"{system_content}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+
+    messages_to_render.append({"role": "system", "content": system_content})
+
+    prompt_messages = _normalize_prompt_messages(prompt)
+    if prompt_messages:
+        messages_to_render.extend(prompt_messages)
+
+    # Add assistant responses from previous turns if provided
+    if messages:
+        messages_to_render.extend(
+            message
+            for message in messages
+            if _should_keep_message(message)
+        )
+
+    rendered_parts = []
+    for message in messages_to_render:
+        role = message["role"]
+        if role == "system":
+            rendered_parts.append(f"<|im_start|>system\n{message['content']}<|im_end|>")
+        elif role == "user":
+            rendered_parts.append(f"<|im_start|>user\n{message['content']}<|im_end|>")
+        elif role == "assistant":
+            assistant_text = ["<|im_start|>assistant", message.get("content", "")]
+            for tool_call in message.get("tool_calls", []):
+                assistant_text.append("<tool_call>")
+                assistant_text.append(json.dumps(tool_call["function"], ensure_ascii=False))
+                assistant_text.append("</tool_call>")
+            assistant_text.append("<|im_end|>")
+            rendered_parts.append("\n".join(part for part in assistant_text if part != ""))
+        elif role == "tool":
+            rendered_parts.append(
+                "<|im_start|>user\n"
+                "<tool_response>\n"
+                f"{message['content']}\n"
+                "</tool_response><|im_end|>"
+            )
+
+    rendered_parts.append("<|im_start|>assistant")
+    return "\n".join(rendered_parts)
 
 
-def _render_recorded_messages(
-    tokenizer,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] = None,
-) -> str:
-    """Render recorded chat messages into transcript text via the tokenizer chat template."""
-    return tokenizer.apply_chat_template(
-        messages,
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=False,
-    )
+def _render_recorded_messages(messages: list[dict[str, Any]]) -> str:
+    """Render recorded chat messages into transcript text without adding a new assistant turn."""
+    rendered_parts = []
+    for message in messages:
+        role = message["role"]
+        if role == "system":
+            rendered_parts.append(f"<|im_start|>system\n{message['content']}<|im_end|>")
+        elif role == "user":
+            rendered_parts.append(f"<|im_start|>user\n{message['content']}<|im_end|>")
+        elif role == "assistant":
+            assistant_text = ["<|im_start|>assistant", message.get("content", "")]
+            for tool_call in message.get("tool_calls", []):
+                assistant_text.append("<tool_call>")
+                assistant_text.append(json.dumps(tool_call["function"], ensure_ascii=False))
+                assistant_text.append("</tool_call>")
+            assistant_text.append("<|im_end|>")
+            rendered_parts.append("\n".join(part for part in assistant_text if part != ""))
+        elif role == "tool":
+            rendered_parts.append(
+                "<|im_start|>user\n"
+                "<tool_response>\n"
+                f"{message['content']}\n"
+                "</tool_response><|im_end|>"
+            )
+    return "\n".join(rendered_parts)
 
 
 def _stringify_message_content(content: Any) -> str:
@@ -153,14 +209,8 @@ def _build_assistant_message(prediction: str) -> dict[str, Any] | None:
     }
 
 
-def _render_tool_message_suffix(tool_message: dict[str, Any]) -> str:
-    """Render the per-turn tool-response suffix in Qwen ChatML format.
-
-    The initial prompt (system+tools+user) is rendered via tokenizer.apply_chat_template,
-    but per-turn tool observations are emitted directly to avoid template re-rendering
-    differences on the trailing assistant turn (Qwen3 injects an empty <think> block
-    when an assistant message is the last in the list, breaking a naive base/full diff).
-    """
+def _render_tool_message(tool_message: dict[str, Any]) -> str:
+    """Render a structured tool message into the rollout transcript format."""
     return (
         "<|im_end|>\n"
         "<|im_start|>user\n"
@@ -175,7 +225,9 @@ def _build_initial_recorded_messages(
     prompt: str | list[dict[str, Any]], system_prompt: str = None
 ) -> list[dict[str, Any]]:
     """Build the initial structured message list used for debugging and replay."""
-    return _build_chat_messages(prompt, system_prompt=system_prompt)
+    recorded_messages = [{"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT}]
+    recorded_messages.extend(_normalize_prompt_messages(prompt))
+    return recorded_messages
 
 
 def _trim_response_token_prefix(
@@ -381,8 +433,7 @@ def postprocess_responses(resp: str) -> str:
 
 
 async def execute_predictions(
-    prediction: str,
-    tool_registry: ToolRegistry,
+    prediction: str, tool_registry: ToolRegistry
 ) -> tuple[str, bool, dict[str, Any] | None]:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
@@ -394,11 +445,11 @@ async def execute_predictions(
         if code:
             result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
-            next_obs = _render_tool_message_suffix(tool_message)
+            next_obs = _render_tool_message(tool_message)
             done = False
         else:
             tool_message = {"role": "tool", "content": "Error: No Python code found"}
-            next_obs = _render_tool_message_suffix(tool_message)
+            next_obs = _render_tool_message(tool_message)
             done = False
     elif action == "answer":
         next_obs = ""
@@ -413,7 +464,7 @@ async def execute_predictions(
                 "If giving the final answer, you should use the format 'Answer: \\boxed{answer}'. PLease try again."
             ),
         }
-        next_obs = _render_tool_message_suffix(tool_message)
+        next_obs = _render_tool_message(tool_message)
         done = False
 
     return next_obs, done, tool_message
@@ -431,13 +482,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(
-        state.tokenizer, prompt=sample.prompt, tools=tool_specs
-    )
+    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
     prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    # Tool descriptions are injected by the tokenizer chat template, so the recorded
-    # system message only stores the base instruction.
-    recorded_messages = _build_initial_recorded_messages(sample.prompt)
+    # Build recorded_messages with the full system prompt (including tool descriptions)
+    # so that payload_text faithfully reflects what the model actually sees.
+    full_system_prompt = DEFAULT_SYSTEM_PROMPT
+    if tool_specs:
+        tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tool_specs)
+        full_system_prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+    recorded_messages = _build_initial_recorded_messages(sample.prompt, system_prompt=full_system_prompt)
     interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
         max_context_length = args.rollout_max_context_len
@@ -464,12 +517,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     last_finish_reason = None
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
-        prompt = format_conversation_with_tools(
-            state.tokenizer,
-            prompt=sample.prompt,
-            tools=tool_specs,
-            messages=interaction_messages,
-        )
+        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
         current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
         # Check if total length exceeds max context length
@@ -545,12 +593,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             break
 
-        # Tool observations are rendered with a hardcoded Qwen ChatML suffix to
-        # avoid template re-rendering quirks on the trailing assistant turn.
-        next_obs, done, tool_message = await execute_predictions(
-            cur_response,
-            tool_registry,
-        )
+        next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
         if done:
             break
 
@@ -621,11 +664,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.status = Sample.Status.TRUNCATED
 
     # Store payload information for wandb logging
-    sample.payload_text = _render_recorded_messages(
-        state.tokenizer, recorded_messages, tools=tool_specs
-    )
-    sample.payload_has_system = any(m.get("role") == "system" for m in recorded_messages)
-    sample.payload_has_tools = bool(tool_specs)
+    sample.payload_text = _render_recorded_messages(recorded_messages)
+    sample.payload_has_system = "<|im_start|>system" in sample.payload_text
+    sample.payload_has_tools = "# Tools" in sample.payload_text
     sample.sandbox_session_id = sandbox_session_id
     sample.sandbox_backend = sandbox_backend
 

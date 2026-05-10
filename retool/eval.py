@@ -365,7 +365,6 @@ async def _generate_one_with_tools(
                 break
 
             rendered_prompt = retool_runtime.format_conversation_with_tools(
-                tokenizer,
                 prompt=prompt,
                 tools=tool_specs,
                 messages=interaction_messages,
@@ -448,10 +447,7 @@ async def _generate_one_with_tools(
             tool_t0 = time.time()
             progress["current_stage"] = "tool"
             progress["stage_started_at"] = tool_t0
-            next_obs, done, tool_message = await retool_runtime.execute_predictions(
-                cur_response,
-                tool_registry,
-            )
+            next_obs, done, tool_message = await retool_runtime.execute_predictions(cur_response, tool_registry)
             tool_dt = time.time() - tool_t0
             if args.debug_trace:
                 print(
@@ -590,9 +586,6 @@ def main() -> None:
     tokenizer = _load_tokenizer(args.tokenizer_path or args.model_path)
     math_dapo_compute_score = _load_math_dapo_compute_score()
     retool_runtime = _load_retool_runtime()
-    # Tool specs are static across examples; capture them once so we can render
-    # the full prompt (system + tools + user) for logging.
-    _tool_specs_for_logging = retool_runtime.ToolRegistry().get_tool_specs()
     dataset = _load_dataset_records(args)
     output_path = Path(args.output) if args.output else None
 
@@ -809,11 +802,6 @@ def main() -> None:
                 result = {
                     "index": ex_index,
                     "prompt": prompt,
-                    "rendered_prompt": retool_runtime.format_conversation_with_tools(
-                        tokenizer,
-                        prompt=prompt,
-                        tools=_tool_specs_for_logging,
-                    ),
                     "label": label,
                     "avg_score": avg_score,
                     "avg_acc": avg_acc,
