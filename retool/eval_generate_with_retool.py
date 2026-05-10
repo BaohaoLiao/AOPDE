@@ -153,53 +153,22 @@ def _build_assistant_message(prediction: str) -> dict[str, Any] | None:
     }
 
 
-def _render_tool_message_delta(
-    tokenizer,
-    prior_messages: list[dict[str, Any]],
-    tool_message: dict[str, Any],
-    tools: list[dict[str, Any]] = None,
-    raw_assistant_text: str | None = None,
-) -> str:
-    """Compute the text suffix produced by appending a tool message after the last assistant turn.
+def _render_tool_message_suffix(tool_message: dict[str, Any]) -> str:
+    """Render the per-turn tool-response suffix in Qwen ChatML format.
 
-    Uses tokenizer.apply_chat_template so the rendering follows the model's chat template
-    (e.g., Qwen wraps tool results as a `user` turn with `<tool_response>` tags).
-
-    Some chat templates (notably Qwen3) render an assistant message with structured
-    `tool_calls` differently depending on whether it is the *last* message (e.g. they
-    inject a placeholder reasoning block). To keep `base` a true prefix of `full`, we
-    optionally re-render the trailing assistant turn using the raw model text so both
-    sides agree on it byte-for-byte.
+    The initial prompt (system+tools+user) is rendered via tokenizer.apply_chat_template,
+    but per-turn tool observations are emitted directly to avoid template re-rendering
+    differences on the trailing assistant turn (Qwen3 injects an empty <think> block
+    when an assistant message is the last in the list, breaking a naive base/full diff).
     """
-    msgs_for_render = list(prior_messages)
-    if (
-        raw_assistant_text is not None
-        and msgs_for_render
-        and msgs_for_render[-1].get("role") == "assistant"
-    ):
-        msgs_for_render[-1] = {"role": "assistant", "content": raw_assistant_text}
-
-    base = tokenizer.apply_chat_template(
-        msgs_for_render,
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=False,
+    return (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<tool_response>\n"
+        f"{tool_message['content']}\n"
+        "</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n"
     )
-    full = tokenizer.apply_chat_template(
-        msgs_for_render + [tool_message],
-        tools=tools,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
-    if full.startswith(base):
-        return full[len(base):]
-    # Fall back to the longest common prefix so we never slice in the middle of
-    # the appended tool turn even if the template still re-renders the prior turns.
-    common = 0
-    max_common = min(len(base), len(full))
-    while common < max_common and base[common] == full[common]:
-        common += 1
-    return full[common:]
 
 
 def _build_initial_recorded_messages(
@@ -414,11 +383,6 @@ def postprocess_responses(resp: str) -> str:
 async def execute_predictions(
     prediction: str,
     tool_registry: ToolRegistry,
-    *,
-    tokenizer,
-    prior_messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]] = None,
-    raw_assistant_text: str | None = None,
 ) -> tuple[str, bool, dict[str, Any] | None]:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
@@ -430,17 +394,11 @@ async def execute_predictions(
         if code:
             result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
-            next_obs = _render_tool_message_delta(
-                tokenizer, prior_messages, tool_message, tools=tools,
-                raw_assistant_text=raw_assistant_text,
-            )
+            next_obs = _render_tool_message_suffix(tool_message)
             done = False
         else:
             tool_message = {"role": "tool", "content": "Error: No Python code found"}
-            next_obs = _render_tool_message_delta(
-                tokenizer, prior_messages, tool_message, tools=tools,
-                raw_assistant_text=raw_assistant_text,
-            )
+            next_obs = _render_tool_message_suffix(tool_message)
             done = False
     elif action == "answer":
         next_obs = ""
@@ -455,10 +413,7 @@ async def execute_predictions(
                 "If giving the final answer, you should use the format 'Answer: \\boxed{answer}'. PLease try again."
             ),
         }
-        next_obs = _render_tool_message_delta(
-            tokenizer, prior_messages, tool_message, tools=tools,
-            raw_assistant_text=raw_assistant_text,
-        )
+        next_obs = _render_tool_message_suffix(tool_message)
         done = False
 
     return next_obs, done, tool_message
@@ -590,18 +545,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.TRUNCATED
             break
 
-        # Build prior structured messages (including the assistant message just appended)
-        # so the tool response is rendered as a delta against the current chat state.
-        prior_messages_for_tool = _build_chat_messages(
-            sample.prompt, messages=interaction_messages
-        )
+        # Tool observations are rendered with a hardcoded Qwen ChatML suffix to
+        # avoid template re-rendering quirks on the trailing assistant turn.
         next_obs, done, tool_message = await execute_predictions(
             cur_response,
             tool_registry,
-            tokenizer=state.tokenizer,
-            prior_messages=prior_messages_for_tool,
-            tools=tool_specs,
-            raw_assistant_text=cur_response,
         )
         if done:
             break
