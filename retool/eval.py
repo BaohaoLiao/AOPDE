@@ -586,6 +586,9 @@ def main() -> None:
     tokenizer = _load_tokenizer(args.tokenizer_path or args.model_path)
     math_dapo_compute_score = _load_math_dapo_compute_score()
     retool_runtime = _load_retool_runtime()
+    # Tool specs are static across examples; capture once so we can render the
+    # full prompt (system + tools + user) for logging into results.jsonl.
+    _tool_specs_for_logging = retool_runtime.ToolRegistry().get_tool_specs()
     dataset = _load_dataset_records(args)
     output_path = Path(args.output) if args.output else None
 
@@ -802,6 +805,10 @@ def main() -> None:
                 result = {
                     "index": ex_index,
                     "prompt": prompt,
+                    "rendered_prompt": retool_runtime.format_conversation_with_tools(
+                        prompt=prompt,
+                        tools=_tool_specs_for_logging,
+                    ),
                     "label": label,
                     "avg_score": avg_score,
                     "avg_acc": avg_acc,
