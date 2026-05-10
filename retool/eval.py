@@ -365,6 +365,7 @@ async def _generate_one_with_tools(
                 break
 
             rendered_prompt = retool_runtime.format_conversation_with_tools(
+                tokenizer,
                 prompt=prompt,
                 tools=tool_specs,
                 messages=interaction_messages,
@@ -447,7 +448,16 @@ async def _generate_one_with_tools(
             tool_t0 = time.time()
             progress["current_stage"] = "tool"
             progress["stage_started_at"] = tool_t0
-            next_obs, done, tool_message = await retool_runtime.execute_predictions(cur_response, tool_registry)
+            prior_messages_for_tool = retool_runtime._build_chat_messages(
+                prompt, messages=interaction_messages
+            )
+            next_obs, done, tool_message = await retool_runtime.execute_predictions(
+                cur_response,
+                tool_registry,
+                tokenizer=tokenizer,
+                prior_messages=prior_messages_for_tool,
+                tools=tool_specs,
+            )
             tool_dt = time.time() - tool_t0
             if args.debug_trace:
                 print(
