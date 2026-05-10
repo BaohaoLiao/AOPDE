@@ -97,7 +97,7 @@ def format_conversation_with_tools(
                 "</tool_response><|im_end|>"
             )
 
-    rendered_parts.append("<|im_start|>assistant")
+    rendered_parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
     return "\n".join(rendered_parts)
 
 
@@ -217,7 +217,7 @@ def _render_tool_message(tool_message: dict[str, Any]) -> str:
         "<tool_response>\n"
         f"{tool_message['content']}\n"
         "</tool_response><|im_end|>\n"
-        "<|im_start|>assistant\n"
+        "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     )
 
 
