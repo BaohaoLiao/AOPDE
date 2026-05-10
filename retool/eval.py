@@ -457,6 +457,7 @@ async def _generate_one_with_tools(
                 tokenizer=tokenizer,
                 prior_messages=prior_messages_for_tool,
                 tools=tool_specs,
+                raw_assistant_text=cur_response,
             )
             tool_dt = time.time() - tool_t0
             if args.debug_trace:

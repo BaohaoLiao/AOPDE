@@ -158,30 +158,43 @@ def _render_tool_message_delta(
     prior_messages: list[dict[str, Any]],
     tool_message: dict[str, Any],
     tools: list[dict[str, Any]] = None,
+    raw_assistant_text: str | None = None,
 ) -> str:
     """Compute the text suffix produced by appending a tool message after the last assistant turn.
 
     Uses tokenizer.apply_chat_template so the rendering follows the model's chat template
     (e.g., Qwen wraps tool results as a `user` turn with `<tool_response>` tags).
+
+    Some chat templates (notably Qwen3) render an assistant message with structured
+    `tool_calls` differently depending on whether it is the *last* message (e.g. they
+    inject a placeholder reasoning block). To keep `base` a true prefix of `full`, we
+    optionally re-render the trailing assistant turn using the raw model text so both
+    sides agree on it byte-for-byte.
     """
+    msgs_for_render = list(prior_messages)
+    if (
+        raw_assistant_text is not None
+        and msgs_for_render
+        and msgs_for_render[-1].get("role") == "assistant"
+    ):
+        msgs_for_render[-1] = {"role": "assistant", "content": raw_assistant_text}
+
     base = tokenizer.apply_chat_template(
-        prior_messages,
+        msgs_for_render,
         tools=tools,
         tokenize=False,
         add_generation_prompt=False,
     )
     full = tokenizer.apply_chat_template(
-        prior_messages + [tool_message],
+        msgs_for_render + [tool_message],
         tools=tools,
         tokenize=False,
         add_generation_prompt=True,
     )
     if full.startswith(base):
         return full[len(base):]
-    # Some chat templates render the trailing assistant turn slightly differently
-    # depending on whether it is followed by a tool message (e.g. extra/omitted
-    # whitespace or a missing closing tag). Fall back to the longest common
-    # prefix so we never slice in the middle of the appended tool turn.
+    # Fall back to the longest common prefix so we never slice in the middle of
+    # the appended tool turn even if the template still re-renders the prior turns.
     common = 0
     max_common = min(len(base), len(full))
     while common < max_common and base[common] == full[common]:
@@ -405,6 +418,7 @@ async def execute_predictions(
     tokenizer,
     prior_messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] = None,
+    raw_assistant_text: str | None = None,
 ) -> tuple[str, bool, dict[str, Any] | None]:
     """Execute predictions and return results"""
     action, content = postprocess_predictions(prediction)
@@ -416,11 +430,17 @@ async def execute_predictions(
         if code:
             result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
-            next_obs = _render_tool_message_delta(tokenizer, prior_messages, tool_message, tools=tools)
+            next_obs = _render_tool_message_delta(
+                tokenizer, prior_messages, tool_message, tools=tools,
+                raw_assistant_text=raw_assistant_text,
+            )
             done = False
         else:
             tool_message = {"role": "tool", "content": "Error: No Python code found"}
-            next_obs = _render_tool_message_delta(tokenizer, prior_messages, tool_message, tools=tools)
+            next_obs = _render_tool_message_delta(
+                tokenizer, prior_messages, tool_message, tools=tools,
+                raw_assistant_text=raw_assistant_text,
+            )
             done = False
     elif action == "answer":
         next_obs = ""
@@ -435,7 +455,10 @@ async def execute_predictions(
                 "If giving the final answer, you should use the format 'Answer: \\boxed{answer}'. PLease try again."
             ),
         }
-        next_obs = _render_tool_message_delta(tokenizer, prior_messages, tool_message, tools=tools)
+        next_obs = _render_tool_message_delta(
+            tokenizer, prior_messages, tool_message, tools=tools,
+            raw_assistant_text=raw_assistant_text,
+        )
         done = False
 
     return next_obs, done, tool_message
@@ -578,6 +601,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             tokenizer=state.tokenizer,
             prior_messages=prior_messages_for_tool,
             tools=tool_specs,
+            raw_assistant_text=cur_response,
         )
         if done:
             break
