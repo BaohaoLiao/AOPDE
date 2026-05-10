@@ -178,8 +178,15 @@ def _render_tool_message_delta(
     )
     if full.startswith(base):
         return full[len(base):]
-    # Fallback: best-effort suffix if the template re-rendered earlier turns differently.
-    return full[len(base):] if len(full) >= len(base) else full
+    # Some chat templates render the trailing assistant turn slightly differently
+    # depending on whether it is followed by a tool message (e.g. extra/omitted
+    # whitespace or a missing closing tag). Fall back to the longest common
+    # prefix so we never slice in the middle of the appended tool turn.
+    common = 0
+    max_common = min(len(base), len(full))
+    while common < max_common and base[common] == full[common]:
+        common += 1
+    return full[common:]
 
 
 def _build_initial_recorded_messages(
