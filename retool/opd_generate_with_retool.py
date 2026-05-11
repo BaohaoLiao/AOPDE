@@ -440,15 +440,49 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _find_boxed_spans(text: str) -> list[tuple[int, int, str]]:
+    """Find all top-level ``\\boxed{...}`` spans with balanced braces.
+
+    Handles arbitrary brace nesting (e.g. ``\\frac{a^{b}}{c}``) which a
+    fixed-depth regex cannot match.
+    """
+    spans: list[tuple[int, int, str]] = []
+    needle = "\\boxed{"
+    i = 0
+    while True:
+        start = text.find(needle, i)
+        if start == -1:
+            break
+        j = start + len(needle)
+        depth = 1
+        content_start = j
+        while j < len(text) and depth > 0:
+            ch = text[j]
+            if ch == "\\" and j + 1 < len(text):
+                j += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((start, j + 1, text[content_start:j]))
+                    j += 1
+                    break
+            j += 1
+        if depth != 0:
+            break
+        i = j
+    return spans
+
+
 def postprocess_predictions(prediction: str):
     """Extract action and content from prediction string"""
     # Stop on any assistant content that contains a boxed final answer.
     # Prefer the last boxed span so trailing reasoning before the final box is tolerated.
-    boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-    boxed_matches = list(re.finditer(boxed_pattern, prediction, re.DOTALL))
-    answer_match = boxed_matches[-1] if boxed_matches else None
-    if answer_match:
-        content = answer_match.group(1).strip()
+    boxed_spans = _find_boxed_spans(prediction)
+    if boxed_spans:
+        content = boxed_spans[-1][2].strip()
         return "answer", content
 
     # Then check for <tool_call> tags (new format from Jinja2 template)
@@ -514,11 +548,9 @@ def postprocess_responses(resp: str) -> str:
 
     # Stop once any boxed final answer appears in the assistant response.
     if "\\boxed{" in resp:
-        boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-        matches = list(re.finditer(boxed_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
+        boxed_spans = _find_boxed_spans(resp)
+        if boxed_spans:
+            return resp[: boxed_spans[-1][1]]
 
     return resp
 

@@ -349,13 +349,43 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _find_boxed_spans(text: str) -> list[tuple[int, int, str]]:
+    """Find all top-level ``\\boxed{...}`` spans with balanced braces."""
+    spans: list[tuple[int, int, str]] = []
+    needle = "\\boxed{"
+    i = 0
+    while True:
+        start = text.find(needle, i)
+        if start == -1:
+            break
+        j = start + len(needle)
+        depth = 1
+        content_start = j
+        while j < len(text) and depth > 0:
+            ch = text[j]
+            if ch == "\\" and j + 1 < len(text):
+                j += 2
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((start, j + 1, text[content_start:j]))
+                    j += 1
+                    break
+            j += 1
+        if depth != 0:
+            break
+        i = j
+    return spans
+
+
 def postprocess_predictions(prediction: str):
     """Extract action and content from prediction string"""
-    boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-    boxed_matches = list(re.finditer(boxed_pattern, prediction, re.DOTALL))
-    answer_match = boxed_matches[-1] if boxed_matches else None
-    if answer_match:
-        content = answer_match.group(1).strip()
+    boxed_spans = _find_boxed_spans(prediction)
+    if boxed_spans:
+        content = boxed_spans[-1][2].strip()
         return "answer", content
 
     tool_call_data = _extract_first_tool_call(prediction)
@@ -402,11 +432,9 @@ def postprocess_responses(resp: str) -> str:
             return resp[: last_match.end()]
 
     if "\\boxed{" in resp:
-        boxed_pattern = r"\\boxed\{((?:[^{}]|\{[^{}]*\})*)\}"
-        matches = list(re.finditer(boxed_pattern, resp, re.DOTALL))
-        if matches:
-            last_match = matches[-1]
-            return resp[: last_match.end()]
+        boxed_spans = _find_boxed_spans(resp)
+        if boxed_spans:
+            return resp[: boxed_spans[-1][1]]
 
     return resp
 
