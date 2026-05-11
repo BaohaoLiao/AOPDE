@@ -213,10 +213,69 @@ conda activate retriever
 # Install PyTorch with CUDA support
 conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
-# Install required packages
-pip install transformers datasets pyserini huggingface_hub
-conda install faiss-gpu=1.8.0 -c pytorch -c nvidia -y
+# Required packages. Pin transformers to a torch-2.4-compatible version
+# (newer transformers calls torch APIs that don't exist in 2.4 and will
+# raise `infer_schema(...) Parameter input has unsupported type torch.Tensor`).
+pip install "transformers==4.46.3" datasets pyserini huggingface_hub
 pip install uvicorn fastapi
+
+# torchvision is not used by the retrieval server and the conda-installed
+# torchvision often mismatches torch (causing
+# `RuntimeError: operator torchvision::nms does not exist`).
+# Easiest: just remove it.
+pip uninstall -y torchvision torchaudio
+```
+
+#### Install faiss with GPU Python bindings
+
+The PyPI wheel (`faiss-gpu-cu12`) is convenient but only ships kernels for SM 7.0–8.9 — it will crash on Hopper (H100, SM 9.0) with `CUDA error 209 no kernel image is available for execution on the device`. The conda-forge package on many clusters ships a C++-only build (no `site-packages/faiss/`) or one without GPU symbols. The reliable path on H100 is to **build faiss v1.9.0 from source**:
+
+```bash
+# Build deps
+conda install -y -c conda-forge cmake "swig=4.2.*" mkl mkl-devel
+
+# Source
+cd /path/to/work_dir   # your build location
+git clone https://github.com/facebookresearch/faiss.git
+cd faiss
+git checkout v1.9.0    # v1.8.0's swig file is incompatible with modern swig
+
+# Configure (BUILD_TESTING=OFF skips perf_tests which needs gflags;
+# CUDA_ARCHITECTURES list must include your GPU: 80=A100, 90=H100)
+cmake -B build . \
+  -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON \
+  -DFAISS_ENABLE_C_API=OFF \
+  -DBUILD_TESTING=OFF \
+  -DFAISS_OPT_LEVEL=avx2 \
+  -DCMAKE_CUDA_ARCHITECTURES="80;90" \
+  -DPython_EXECUTABLE=$(which python) \
+  -DSWIG_EXECUTABLE=$(which swig)
+
+# Build & install
+make -C build -j$(nproc) faiss swigfaiss
+cd build/faiss/python && pip install .
+```
+
+Verify:
+
+```bash
+python -c "import faiss; print(faiss.__file__, faiss.__version__, hasattr(faiss,'GpuMultipleClonerOptions'))"
+# Expected: .../site-packages/faiss/__init__.py 1.9.0 True
+```
+
+Notes:
+- If you only have A100s, drop `90` from `CMAKE_CUDA_ARCHITECTURES`. For Blackwell (B100/B200) add `100`.
+- `swig=4.2.*` is required; the v1.9.0 swig file does not compile with system `swig 3.x` (`SWIGTYPE_p_unsigned_long_long was not declared`) nor with `swig 4.4.x`.
+- If a system `swig` is on `PATH`, force the conda one with `-DSWIG_EXECUTABLE=$(which swig)` and / or `export PATH=$CONDA_PREFIX/bin:$PATH` before re-running cmake.
+
+#### CPU fallback
+
+If you cannot get GPU faiss working (e.g. unsupported GPU arch), CPU faiss + GPU encoder is plenty fast for eval:
+
+```bash
+pip uninstall -y faiss faiss-gpu faiss-gpu-cu12 2>/dev/null
+pip install faiss-cpu
+# then drop --faiss_gpu from the retrieval_server.py launch command
 ```
 
 ### Step 3: Download Index and Corpus
@@ -247,6 +306,11 @@ gzip -d $save_path/wiki-18.jsonl.gz
 
 # Activate retriever environment
 conda activate retriever
+
+# Make the env's libstdc++ visible (otherwise torch's bundled libnccl
+# may complain: `libstdc++.so.6: version CXXABI_1.3.15' not found`).
+# The cublas dir is only needed if you used the pip faiss-gpu-cu12 wheel.
+export LD_LIBRARY_PATH=$CONDA_PREFIX/lib:$LD_LIBRARY_PATH
 
 # Set paths
 save_path=/root/Index
