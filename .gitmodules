@@ -1,3 +1,6 @@
 [submodule "third_party/slime"]
 	path = third_party/slime
 	url = https://github.com/BaohaoLiao/slime.git
+[submodule "third_party/Search-R1"]
+	path = third_party/Search-R1
+	url = https://github.com/BaohaoLiao/Search-R1.git
