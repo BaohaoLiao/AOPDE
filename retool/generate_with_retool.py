@@ -14,7 +14,7 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
+from tool_sandbox import TOOL_CONFIGS, ToolRegistry
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
@@ -476,8 +476,14 @@ async def execute_predictions(
         # postprocess_predictions)
         code = content.strip()
         if code:
-            async with SEMAPHORE:
-                result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            # NOTE: do NOT wrap this call in `async with SEMAPHORE`. The same
+            # semaphore is already acquired inside ToolRegistry.execute_tool,
+            # and asyncio.Semaphore is not reentrant — double-acquiring it
+            # from N=concurrency coroutines deadlocks the entire rollout
+            # (every holder blocks on the inner acquire and no slot is ever
+            # released). Symptom: SGLang stops receiving /generate requests
+            # mid-batch while only /metrics polls continue.
+            result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
             next_obs = _render_tool_message(tool_message)
             done = False

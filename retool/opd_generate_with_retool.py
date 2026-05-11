@@ -21,7 +21,7 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
+from tool_sandbox import TOOL_CONFIGS, ToolRegistry
 
 # Wall-clock cap for the full multi-turn rollout of a single sample. When
 # exceeded, the partial response is kept (so far decoded tokens) and the
@@ -566,8 +566,11 @@ async def execute_predictions(
         # postprocess_predictions)
         code = content.strip()
         if code:
-            async with SEMAPHORE:
-                result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            # NOTE: do NOT wrap this call in `async with SEMAPHORE`. The same
+            # semaphore is already acquired inside ToolRegistry.execute_tool,
+            # and asyncio.Semaphore is not reentrant -- double-acquiring it
+            # from N=concurrency coroutines deadlocks the entire rollout.
+            result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
             next_obs = _render_tool_message(tool_message)
             done = False
