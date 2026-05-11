@@ -176,6 +176,62 @@ CUSTOM_ARGS=(
 
 These are the `generate` and `reward_func` functions in `generate_with_search.py`.
 
+## Evaluation
+
+`search-r1/eval.py` runs an async, multi-turn rollout (`<search>` / `<answer>`) against a stand-alone SGLang inference server plus the local retrieval server, and scores responses with the Search-R1 EM grader. Three terminals are involved:
+
+1. Retrieval server (the `retriever` env from the Appendix)
+2. SGLang inference server (your training/inference env, with sglang installed)
+3. Eval driver
+
+### 1. Start the retrieval server
+
+Follow the [Appendix](#appendix-setting-up-local-retriever). Once it's up on `http://127.0.0.1:8000/retrieve`, leave it running.
+
+### 2. Start the SGLang server
+
+In a separate shell (NOT the `retriever` env), use `search-r1/sglang_serve.sh`. All knobs are env-overridable:
+
+```bash
+MODEL_PATH=/path/to/hf_checkpoint \
+PORT=30000 \
+TP_SIZE=2 DP_SIZE=1 \
+CUDA_VISIBLE_DEVICES=0,1 \
+    bash search-r1/sglang_serve.sh
+```
+
+Total GPUs used = `TP_SIZE * DP_SIZE`; set `CUDA_VISIBLE_DEVICES` accordingly. Wait until you see SGLang's `The server is fired up and ready to roll!` log line.
+
+### 3. Run the eval driver
+
+In a third shell:
+
+```bash
+MODEL_PATH=/path/to/hf_checkpoint \
+DATASET=/path/to/test.parquet \
+PORT=30000 \
+SEARCH_URL=http://127.0.0.1:8000/retrieve \
+    bash search-r1/eval.sh
+```
+
+Required env:
+- `MODEL_PATH` — the same HF checkpoint dir SGLang is serving (used for the tokenizer / chat template).
+- `DATASET` — Search-R1 test parquet (verl-style schema with `prompt`, `data_source`, `reward_model.ground_truth.target`). Also accepts `.jsonl` or an HF dataset id.
+
+Common optional env:
+- `MAX_TURNS` (default `4`), `TOPK` (default `3`)
+- `NUM_SAMPLES` (default `1`) — n samples per prompt
+- `MAX_CONCURRENT` (default `8`) — concurrent rollouts
+- `LIMIT` — only evaluate the first N rows
+- `DATA_SOURCE_FILTER` — comma-separated list of `data_source` values to keep (e.g. `nq,hotpotqa`)
+- `TEMPERATURE` (default `0.0`), `TOP_P` (default `1.0`)
+- `MAX_NEW_TOKENS` (default `1024`), `MAX_CONTEXT_LEN` (default `8192`)
+- `OUTPUT` / `SUMMARY_OUTPUT` — JSONL + summary paths (default under `$MODEL_PATH/`)
+- `PRINT_TURNS=1` — print each turn to stdout for sanity-checking
+- `DEBUG_TRACE=1` — verbose request/response logging
+
+The driver writes one JSON line per (prompt, sample) including `rendered_prompt`, the multi-turn trace, the predicted answer, the gold target, and the EM score; the summary file aggregates per-`data_source` accuracy.
+
 ## Appendix: Setting up Local Retriever
 
 This section provides detailed instructions for setting up the local dense retriever for use with the local search backend.
