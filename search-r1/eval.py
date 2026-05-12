@@ -336,7 +336,9 @@ async def _generate_one_with_search(
                 turns.append(turn_record)
                 break
 
-            if "<information>" in next_obs:
+
+            # Increment search_count only when <tool_response> is present in the observation (successful search)
+            if "<tool_response>" in next_obs:
                 search_count += 1
 
             response_parts.append(next_obs)
