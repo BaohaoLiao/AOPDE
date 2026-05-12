@@ -48,13 +48,6 @@ def parse_args() -> argparse.Namespace:
             "<output>.bak before being overwritten."
         ),
     )
-    parser = argparse.ArgumentParser(
-        description=(
-            "Evaluate a Search-R1 model against an already-running SGLang server "
-            "(start it with search-r1/sglang_serve.sh) and an already-running local "
-            "retrieval server (Search-R1's retrieval_launch.sh)."
-        )
-    )
     parser.add_argument("--model-path", required=True, help="HF model path (used for the chat template + summary)")
     parser.add_argument("--tokenizer-path", default=None, help="Tokenizer path. Defaults to --model-path.")
     parser.add_argument("--dataset", required=True, help="Search-R1 test parquet (or jsonl/HF dataset name)")
