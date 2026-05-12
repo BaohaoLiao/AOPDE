@@ -31,16 +31,23 @@ if str(SCRIPT_DIR) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
-        parser.add_argument(
-            "--resume",
-            action="store_true",
-            help=(
-                "Resume from an existing --output JSONL: re-run only the timed-out or missing samples "
-                "per prompt (keeping non-timeout samples), and re-run all samples for prompts "
-                "whose samples were all timed out. The original output file is backed up to "
-                "<output>.bak before being overwritten."
-            ),
+    parser = argparse.ArgumentParser(
+        description=(
+            "Evaluate a Search-R1 model against an already-running SGLang server "
+            "(start it with search-r1/sglang_serve.sh) and an already-running local "
+            "retrieval server (Search-R1's retrieval_launch.sh)."
         )
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from an existing --output JSONL: re-run only the timed-out or missing samples "
+            "per prompt (keeping non-timeout samples), and re-run all samples for prompts "
+            "whose samples were all timed out. The original output file is backed up to "
+            "<output>.bak before being overwritten."
+        ),
+    )
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate a Search-R1 model against an already-running SGLang server "
