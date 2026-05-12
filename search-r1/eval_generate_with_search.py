@@ -143,7 +143,7 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
         next_obs = (
             "<|im_start|>user\n<tool_response>\n"
             f"{search_results.strip()}\n"
-            "</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            "</tool_response><|im_end|>\n<|im_start|>assistant\n"
         )
         return next_obs, False
     if action == "answer":
@@ -201,5 +201,5 @@ def format_conversation_with_tools(
                 f"{message['content']}\n"
                 "</tool_response><|im_end|>"
             )
-    rendered_parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    rendered_parts.append("<|im_start|>assistant\n")
     return "\n".join(rendered_parts)
