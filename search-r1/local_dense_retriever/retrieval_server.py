@@ -213,10 +213,9 @@ class DenseRetriever(BaseRetriever):
             co.useFloat16 = True
             co.shard = True
             num_gpus = torch.cuda.device_count()
-            res = [faiss.StandardGpuResources() for _ in range(num_gpus)]
-            import numpy as np
-            device_list = np.arange(num_gpus).astype('int32')
-            self.index = faiss.index_cpu_to_gpu_multiple(res, device_list, self.index, co)
+            if num_gpus == 0:
+                raise RuntimeError("--faiss_gpu was set, but no CUDA devices are visible")
+            self.index = faiss.index_cpu_to_all_gpus(self.index, co)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
