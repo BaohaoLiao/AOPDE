@@ -411,6 +411,40 @@ def _print_trace_turns(example_index: int, trace: dict[str, Any]) -> None:
             print(turn["observation"])
 
 
+def _tool_response_contents(observation: str) -> list[str]:
+    contents = []
+    start_tag = "<tool_response>"
+    end_tag = "</tool_response>"
+    start = 0
+    while True:
+        start = observation.find(start_tag, start)
+        if start == -1:
+            break
+        start += len(start_tag)
+        end = observation.find(end_tag, start)
+        if end == -1:
+            break
+        contents.append(observation[start:end].strip())
+        start = end + len(end_tag)
+    return contents
+
+
+def _count_search_outcomes(traces: list[dict[str, Any]]) -> tuple[int, int]:
+    empty_results = 0
+    errors = 0
+    for trace in traces:
+        for turn in trace.get("turns", []):
+            observation = turn.get("observation", "")
+            if not isinstance(observation, str):
+                continue
+            for content in _tool_response_contents(observation):
+                if not content:
+                    empty_results += 1
+                elif content.startswith("[ERROR]"):
+                    errors += 1
+    return empty_results, errors
+
+
 # ---------------------------------------------------------------------------
 # Main eval driver
 # ---------------------------------------------------------------------------
@@ -489,6 +523,8 @@ def main() -> None:
         total_score = 0.0
         total_timeouts = 0
         examples_with_any_timeout = 0
+        total_empty_search_results = 0
+        total_search_errors = 0
 
         async def _safe_generate(ex_index: int, sample_idx: int, prompt_text: str) -> dict[str, Any]:
             tag = f"[ex{ex_index} s{sample_idx}]"
@@ -532,6 +568,7 @@ def main() -> None:
         async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
             nonlocal done_examples, num_correct, total_score
             nonlocal total_timeouts, examples_with_any_timeout
+            nonlocal total_empty_search_results, total_search_errors
 
             messages = _row_messages(row)
             ground_truth = _row_ground_truth(row)
@@ -580,6 +617,16 @@ def main() -> None:
                             num_correct += float(prev.get("avg_acc_excl_timeout", 0.0) or 0.0)
                             total_score += float(prev.get("avg_score_excl_timeout", 0.0) or 0.0)
                             total_timeouts += num_timeouts_prev
+                            empty_prev = prev.get("empty_search_results")
+                            errors_prev = prev.get("search_errors")
+                            if empty_prev is None or errors_prev is None:
+                                empty_prev, errors_prev = _count_search_outcomes(prev.get("traces", []) or [])
+                            empty_prev = int(empty_prev or 0)
+                            errors_prev = int(errors_prev or 0)
+                            prev["empty_search_results"] = empty_prev
+                            prev["search_errors"] = errors_prev
+                            total_empty_search_results += empty_prev
+                            total_search_errors += errors_prev
                             if num_timeouts_prev > 0:
                                 examples_with_any_timeout += 1
                             if output_file is not None:
@@ -587,7 +634,12 @@ def main() -> None:
                                 output_file.flush()
                             running_acc = num_correct / done_examples if done_examples else 0.0
                             print(
-                                f"[{done_examples}/{num_examples}] ex{ex_index} [resume:keep] timeouts={num_timeouts_prev}/{args.num_samples} running_acc={running_acc:.4f}",
+                                f"[{done_examples}/{num_examples}] ex{ex_index} [resume:keep] "
+                                f"timeouts={num_timeouts_prev}/{args.num_samples} "
+                                f"empty_search={empty_prev} search_errors={errors_prev} "
+                                f"running_empty_search={total_empty_search_results} "
+                                f"running_search_errors={total_search_errors} "
+                                f"running_acc={running_acc:.4f}",
                                 flush=True,
                             )
                         return
@@ -622,6 +674,7 @@ def main() -> None:
             valid_traces = [t for t in traces if not t["timed_out"]]
             num_timeouts = len(traces) - len(valid_traces)
             all_timed_out = len(valid_traces) == 0
+            empty_search_results, search_errors = _count_search_outcomes(traces)
 
             avg_score = sum(t["score"] for t in traces) / len(traces)
             avg_acc = sum(int(t["acc"]) for t in traces) / len(traces)
@@ -643,6 +696,8 @@ def main() -> None:
                 "avg_acc_excl_timeout": avg_acc_excl_timeout,
                 "avg_score_excl_timeout": avg_score_excl_timeout,
                 "num_timeouts": num_timeouts,
+                "empty_search_results": empty_search_results,
+                "search_errors": search_errors,
                 "all_timed_out": all_timed_out,
                 "traces": traces,
             }
@@ -652,6 +707,8 @@ def main() -> None:
                 total_score += avg_score_excl_timeout
                 done_examples += 1
                 total_timeouts += num_timeouts
+                total_empty_search_results += empty_search_results
+                total_search_errors += search_errors
                 if num_timeouts > 0:
                     examples_with_any_timeout += 1
                 if output_file is not None:
@@ -663,6 +720,10 @@ def main() -> None:
                     f"data_source={row.get('data_source')} "
                     f"avg_acc_excl_timeout={avg_acc_excl_timeout:.3f} "
                     f"timeouts={num_timeouts}/{args.num_samples} "
+                    f"empty_search={empty_search_results} "
+                    f"search_errors={search_errors} "
+                    f"running_empty_search={total_empty_search_results} "
+                    f"running_search_errors={total_search_errors} "
                     f"running_acc={running_acc:.4f}",
                     flush=True,
                 )
@@ -712,6 +773,10 @@ def main() -> None:
                 "examples_with_any_timeout": examples_with_any_timeout,
                 "sample_timeout_seconds": args.sample_timeout,
                 "request_timeout_seconds": args.request_timeout,
+            },
+            "search_stats": {
+                "empty_search_results": total_empty_search_results,
+                "search_errors": total_search_errors,
             },
             "model_path": args.model_path,
             "dataset": args.dataset,

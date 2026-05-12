@@ -87,8 +87,7 @@ async def local_search(
     try:
         urls = _round_robin_urls(search_url)
     except Exception as e:
-        print(f"Invalid local search URL configuration {search_url!r}: {e}")
-        return []
+        raise ValueError(f"Invalid local search URL configuration {search_url!r}: {e}") from e
     async with aiohttp.ClientSession() as session:
         for url in urls:
             try:
@@ -100,8 +99,7 @@ async def local_search(
                 errors.append(f"{url}: {e}")
 
     if result is None:
-        print(f"Error calling local search engine; all retriever URLs failed: {'; '.join(errors)}")
-        return []
+        raise RuntimeError(f"All local retriever URLs failed: {'; '.join(errors)}")
 
     # Parse retrieval results
     # Format from retrieval_server.py: {"result": [[{"document": {"id": "...", "contents": "..."}}]]}
