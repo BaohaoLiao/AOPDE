@@ -3,34 +3,55 @@
 # `reward_func()` entry points so the file can be imported by `eval.py`
 # without needing the slime training stack.
 import asyncio
+import json
 import re
+from typing import Any
 
 # Configuration for Search-R1 eval. Override SEARCH_R1_CONFIGS["search_backend"],
 # SEARCH_R1_CONFIGS["local"]["search_url"], etc. before calling search().
+
+# System prompt and tool definition (retool style)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant that can use tools to answer questions. "
+    "You have access to a search tool. When you need to look up information, "
+    "call the search tool as described below."
+)
+
+TOOL_SYSTEM_PROMPT = """# Tools
+
+You may call one function at a time to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+<tool name=\"search\" description=\"Search for information.\" args=\"{\\\"query\\\": string}\" />
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
+After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
+<tool_call>
+{"name": "search", "arguments": {"query": "..."}}
+</tool_call>"""
+
 SEARCH_R1_CONFIGS = {
-    # ============== General Configuration ==============
     "max_turns": 4,
     "topk": 3,
     "search_concurrency": 256,
-    # ============== Search Backend Selection ==============
-    "search_backend": "local",  # Options: "local" or "google"
-    # ============== Local Search Configuration ==============
+    "search_backend": "local",
     "local": {
         "search_url": "http://127.0.0.1:8000/retrieve",
         "proxy": None,
     },
-    # ============== Google Search Configuration ==============
     "google": {
         "api_key": "your_api_key_here",
         "snippet_only": True,
         "proxy": None,
     },
-    # ============== Reward Model Configuration ==============
     "format_score": 0.2,
 }
 
 
 SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
+
 
 
 def _passages2string(retrieval_result):
@@ -44,13 +65,12 @@ def _passages2string(retrieval_result):
     return format_reference
 
 
+
 async def search(query: str) -> str:
     """Perform search using either local search engine or Google search."""
     backend = SEARCH_R1_CONFIGS["search_backend"]
-
     if backend == "local":
         from local_search_server import local_search
-
         local_config = SEARCH_R1_CONFIGS["local"]
         result = await local_search(
             local_config["search_url"],
@@ -60,7 +80,6 @@ async def search(query: str) -> str:
         )
     elif backend == "google":
         from google_search_server import google_search
-
         google_config = SEARCH_R1_CONFIGS["google"]
         result = await google_search(
             google_config["api_key"],
@@ -70,46 +89,117 @@ async def search(query: str) -> str:
             proxy=google_config["proxy"],
         )
     else:
-        raise ValueError(
-            f"Unknown search backend: {backend}. Must be either 'local' or 'google'."
-        )
-
+        raise ValueError(f"Unknown search backend: {backend}. Must be either 'local' or 'google'.")
     return _passages2string(result)
 
 
+
 def postprocess_responses(resp: str) -> str:
-    """Truncate the assistant response at the first closing </search> or </answer> tag."""
-    if "</search>" in resp:
-        return resp.split("</search>")[0] + "</search>"
+    """Truncate the assistant response at the first closing </tool_call> or </answer> tag."""
+    if "</tool_call>" in resp:
+        return resp.split("</tool_call>")[0] + "</tool_call>"
     if "</answer>" in resp:
         return resp.split("</answer>")[0] + "</answer>"
     return resp
 
 
+
+# Tool call extraction (retool style)
+def _extract_first_tool_call(prediction: str) -> dict[str, Any] | None:
+    tool_call_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
+    if not tool_call_match:
+        return None
+    try:
+        json_str = tool_call_match.group(1).replace("\n", "\\n")
+        tool_call_data = json.loads(json_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(tool_call_data, dict):
+        return None
+    return tool_call_data
+
 def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
     """Return (action, content) where action is 'search'|'answer'|None."""
-    pattern = r"<(search|answer)>(.*?)</\1>"
+    tool_call = _extract_first_tool_call(prediction)
+    if tool_call and tool_call.get("name") == "search":
+        return "search", tool_call["arguments"]["query"]
+    # fallback: check for <answer>
+    pattern = r"<answer>(.*?)</answer>"
     match = re.search(pattern, prediction, re.DOTALL)
     if match:
-        return match.group(1), match.group(2).strip()
+        return "answer", match.group(1).strip()
     return None, ""
+
 
 
 async def execute_predictions(prediction: str) -> tuple[str, bool]:
     """Run the action implied by `prediction`. Return (next_observation, done)."""
     action, content = postprocess_predictions(prediction)
-
     if action == "search":
         async with SEMAPHORE:
             search_results = await search(content)
-        next_obs = f"\n\n<information>{search_results.strip()}</information>\n\n"
+        # Return as <tool_response> in user message, retool style
+        next_obs = (
+            "<|im_start|>user\n<tool_response>\n"
+            f"{search_results.strip()}\n"
+            "</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
         return next_obs, False
     if action == "answer":
         return "", True
     next_obs = (
         "\nMy previous action is invalid. "
-        "If I want to search, I should put the query between <search> and </search>. "
+        "If I want to use a tool, I should return a <tool_call>...</tool_call> block. "
         "If I want to give the final answer, I should put the answer between <answer> and </answer>. "
         "Let me try again.\n"
     )
     return next_obs, False
+# ...existing code...
+
+# Conversation rendering (retool style)
+def format_conversation_with_tools(
+    prompt: str | list[dict[str, Any]],
+    system_prompt: str = None,
+    messages: list[dict[str, Any]] = None,
+) -> str:
+    """Format conversation using a static system prompt and explicit message rendering."""
+    messages_to_render = []
+    # Always add system message - use provided one or default
+    if system_prompt:
+        system_content = system_prompt
+    else:
+        system_content = DEFAULT_SYSTEM_PROMPT
+    system_content = f"{system_content}\n\n{TOOL_SYSTEM_PROMPT}"
+    messages_to_render.append({"role": "system", "content": system_content})
+    # Add user prompt
+    if isinstance(prompt, str):
+        messages_to_render.append({"role": "user", "content": prompt})
+    elif isinstance(prompt, list):
+        messages_to_render.extend(prompt)
+    # Add assistant responses from previous turns if provided
+    if messages:
+        messages_to_render.extend(messages)
+    rendered_parts = []
+    for message in messages_to_render:
+        role = message["role"]
+        if role == "system":
+            rendered_parts.append(f"<|im_start|>system\n{message['content']}<|im_end|>")
+        elif role == "user":
+            rendered_parts.append(f"<|im_start|>user\n{message['content']}<|im_end|>")
+        elif role == "assistant":
+            assistant_text = ["<|im_start|>assistant", message.get("content", "")]
+            for tool_call in message.get("tool_calls", []):
+                assistant_text.append("<tool_call>")
+                assistant_text.append(json.dumps(tool_call["function"], ensure_ascii=False))
+                assistant_text.append("</tool_call>")
+            assistant_text.append("<|im_end|>")
+            rendered_parts.append("\n".join(part for part in assistant_text if part != ""))
+        elif role == "tool":
+            rendered_parts.append(
+                "<|im_start|>user\n<tool_response>\n"
+                f"{message['content']}\n"
+                "</tool_response><|im_end|>"
+            )
+    rendered_parts.append("<|im_start|>assistant\n<think>\n\n</think>\n\n")
+    return "\n".join(rendered_parts)
