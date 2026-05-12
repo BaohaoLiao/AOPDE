@@ -45,7 +45,7 @@ SEARCH_R1_CONFIGS = {
     "search_concurrency": 256,
     "search_backend": "local",
     "local": {
-        "search_url": "http://127.0.0.1:8000/retrieve",
+        "search_url": "http://127.0.0.1:8000/retrieve",  # Comma-separate multiple local retriever URLs.
         "proxy": None,
     },
     "google": {

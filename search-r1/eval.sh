@@ -8,7 +8,7 @@
 # Then in another shell:
 #   MODEL_PATH=/path/to/hf PORT=30000 \
 #       DATASET=/path/to/test.parquet \
-#       SEARCH_URL=http://127.0.0.1:8000/retrieve \
+#       SEARCH_URL=http://127.0.0.1:8000/retrieve,http://127.0.0.1:8001/retrieve \
 #       bash search-r1/eval.sh
 
 set -ex
@@ -29,7 +29,7 @@ TOP_P=${TOP_P:-1.0}
 HOST=${HOST:-127.0.0.1}
 PORT=${PORT:-30000}
 SEARCH_BACKEND=${SEARCH_BACKEND:-local}
-SEARCH_URL=${SEARCH_URL:-http://127.0.0.1:8008/retrieve}  # Use nginx/haproxy load balancer on port 8008
+SEARCH_URL=${SEARCH_URL:-http://127.0.0.1:8000/retrieve,http://127.0.0.1:8001/retrieve}
 
 OUTPUT=${OUTPUT:-${MODEL_PATH}/eval_search_r1.jsonl}
 SUMMARY_OUTPUT=${SUMMARY_OUTPUT:-${MODEL_PATH}/eval_search_r1_summary.json}

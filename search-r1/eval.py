@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-turns", type=int, default=4, help="Max search rounds per trace")
     parser.add_argument("--topk", type=int, default=3, help="topk for the retrieval server")
     parser.add_argument("--search-url", default="http://127.0.0.1:8000/retrieve",
-                        help="URL of the local retrieval server")
+                        help="URL of the local retrieval server, or comma-separated URLs for round-robin")
     parser.add_argument("--search-backend", choices=["local", "google"], default="local")
     parser.add_argument("--google-api-key", default=None, help="serper.dev API key (when --search-backend=google)")
     parser.add_argument("--google-snippet-only", action="store_true", default=True)

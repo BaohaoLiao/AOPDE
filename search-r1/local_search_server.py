@@ -13,17 +13,40 @@ Usage:
 
     And update SEARCH_R1_CONFIGS:
         SEARCH_R1_CONFIGS = {
-            "search_url": "http://127.0.0.1:8000/retrieve",  # URL of local retrieval server
+            "search_url": "http://127.0.0.1:8000/retrieve,http://127.0.0.1:8001/retrieve",
             "topk": 3,
             ...
         }
 """
 
+import itertools
+from collections.abc import Sequence
+
 import aiohttp
 
 
+_SEARCH_URL_COUNTER = itertools.count()
+
+
+def _normalize_search_urls(search_url: str | Sequence[str]) -> list[str]:
+    if isinstance(search_url, str):
+        urls = [url.strip() for url in search_url.split(",")]
+    else:
+        urls = [str(url).strip() for url in search_url]
+    urls = [url for url in urls if url]
+    if not urls:
+        raise ValueError("search_url must contain at least one URL")
+    return urls
+
+
+def _round_robin_urls(search_url: str | Sequence[str]) -> list[str]:
+    urls = _normalize_search_urls(search_url)
+    offset = next(_SEARCH_URL_COUNTER) % len(urls)
+    return urls[offset:] + urls[:offset]
+
+
 async def local_search(
-    search_url: str,
+    search_url: str | Sequence[str],
     query: str,
     top_k: int = 5,
     timeout: int = 60,
@@ -37,7 +60,7 @@ async def local_search(
     it uses a search_url parameter.
 
     Args:
-        search_url: URL of the local retrieval server (e.g., "http://127.0.0.1:8000/retrieve")
+        search_url: URL of the local retrieval server, or comma-separated URLs.
         query: Search query string
         top_k: Number of results to retrieve
         timeout: Request timeout in seconds (default: 60)
@@ -55,20 +78,29 @@ async def local_search(
         "return_scores": False,  # We don't need scores for compatibility with google_search_server
     }
 
-    # Send async request to local retrieval server
+    # Send async request to a local retrieval server. If multiple comma-separated
+    # URLs are provided, load balance with round-robin and fail over to the next.
     timeout_obj = aiohttp.ClientTimeout(total=timeout)
-    session_kwargs = {}
-    # Note: proxy parameter is kept for API compatibility but typically not needed for local server
-    if proxy:
-        session_kwargs["proxy"] = proxy
 
+    result = None
+    errors = []
     try:
-        async with aiohttp.ClientSession(**session_kwargs) as session:
-            async with session.post(search_url, json=payload, timeout=timeout_obj) as resp:
-                resp.raise_for_status()
-                result = await resp.json()
+        urls = _round_robin_urls(search_url)
     except Exception as e:
-        print(f"Error calling local search engine at {search_url}: {e}")
+        print(f"Invalid local search URL configuration {search_url!r}: {e}")
+        return []
+    async with aiohttp.ClientSession() as session:
+        for url in urls:
+            try:
+                async with session.post(url, json=payload, timeout=timeout_obj, proxy=proxy) as resp:
+                    resp.raise_for_status()
+                    result = await resp.json()
+                    break
+            except Exception as e:
+                errors.append(f"{url}: {e}")
+
+    if result is None:
+        print(f"Error calling local search engine; all retriever URLs failed: {'; '.join(errors)}")
         return []
 
     # Parse retrieval results
