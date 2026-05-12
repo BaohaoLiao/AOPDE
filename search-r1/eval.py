@@ -436,25 +436,25 @@ def _apply_runtime_overrides(args: argparse.Namespace, runtime: Any) -> None:
 
 
 def main() -> None:
-        def _load_resume_records(output_path: Path) -> dict[int, dict[str, Any]]:
-            """Load an existing eval JSONL into {example_index: result_record}. Last one wins."""
-            records: dict[int, dict[str, Any]] = {}
-            if not output_path or not output_path.exists():
-                return records
-            with output_path.open("r", encoding="utf-8") as f:
-                for line_no, line in enumerate(f, start=1):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                    except json.JSONDecodeError as exc:
-                        print(f"[resume] skipping malformed line {line_no} in {output_path}: {exc}", flush=True)
-                        continue
-                    idx = rec.get("index")
-                    if isinstance(idx, int):
-                        records[idx] = rec
+    def _load_resume_records(output_path: Path) -> dict[int, dict[str, Any]]:
+        """Load an existing eval JSONL into {example_index: result_record}. Last one wins."""
+        records: dict[int, dict[str, Any]] = {}
+        if not output_path or not output_path.exists():
             return records
+        with output_path.open("r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    print(f"[resume] skipping malformed line {line_no} in {output_path}: {exc}", flush=True)
+                    continue
+                idx = rec.get("index")
+                if isinstance(idx, int):
+                    records[idx] = rec
+        return records
     args = parse_args()
     tokenizer = _load_tokenizer(args.tokenizer_path or args.model_path)
     runtime = _load_runtime()
