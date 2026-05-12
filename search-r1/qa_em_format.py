@@ -126,16 +126,18 @@ def is_valid_sequence(text):
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
 
+    # Try <answer>...</answer> first
     answer_pattern = r"<answer>(.*?)</answer>"
     match = re.finditer(answer_pattern, solution_str, re.DOTALL)
     matches = list(match)
-
-    # If there are 0 or exactly 1 matches, return None
-    if len(matches) <= 1:
-        return None
-
-    # If there are 2 or more matches, return the last one
-    return matches[-1].group(1).strip()
+    if len(matches) > 1:
+        return matches[-1].group(1).strip()
+    # If not found, try \\boxed{...}
+    boxed_pattern = r"\\boxed\{([^}]*)\}"
+    boxed_matches = re.findall(boxed_pattern, solution_str)
+    if boxed_matches:
+        return boxed_matches[-1].strip()
+    return None
 
 
 def extract_information_blocks(text: str) -> list[str]:
