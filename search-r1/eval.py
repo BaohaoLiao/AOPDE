@@ -491,9 +491,15 @@ def main() -> None:
             nonlocal done_examples, num_correct, total_score
             nonlocal total_timeouts, examples_with_any_timeout
 
+
             messages = _row_messages(row)
             ground_truth = _row_ground_truth(row)
-            prompt_text = _render_prompt(tokenizer, messages)
+            # Use the new tool-based format for prompt rendering
+            prompt_text = runtime.format_conversation_with_tools(
+                prompt=messages,
+                system_prompt=None,
+                messages=None
+            )
 
             generations = await asyncio.gather(*[
                 _safe_generate(ex_index, i, prompt_text) for i in range(args.num_samples)
