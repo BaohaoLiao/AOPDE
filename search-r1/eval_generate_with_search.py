@@ -151,11 +151,14 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
         return next_obs, False
     if action == "answer":
         return "", True
+    # Move the invalid action message into a user message, matching retool style
     next_obs = (
-        "\nMy previous action is invalid. "
-        "If I want to use a tool, I should return a <tool_call>...</tool_call> block. "
-        "If I want to give the final answer, I should put the answer between <answer> and </answer>. "
-        "Let me try again.\n"
+        "<|im_start|>user\n"
+        "Your previous action is invalid. "
+        "If you want to use a tool, you should return a <tool_call>...</tool_call> block. "
+        "If you want to give the final answer, you should put the answer between <answer> and </answer>. "
+        "Please try again.\n"
+        "<|im_end|>\n<|im_start|>assistant\n"
     )
     return next_obs, False
 # ...existing code...
