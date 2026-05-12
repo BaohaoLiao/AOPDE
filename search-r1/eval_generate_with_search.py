@@ -119,6 +119,15 @@ def _extract_first_tool_call(prediction: str) -> dict[str, Any] | None:
         return None
     return tool_call_data
 
+
+def extract_boxed_answer(prediction: str) -> str | None:
+    """Extracts the answer from any occurrence of \\boxed{...} (LaTeX style)."""
+    pattern = r"\\boxed\{([^}]*)\}"
+    matches = re.findall(pattern, prediction)
+    if matches:
+        return matches[-1].strip()
+    return None
+
 def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
     """Return (action, content) where action is 'search'|'answer'|None."""
     tool_call = _extract_first_tool_call(prediction)
@@ -129,6 +138,10 @@ def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
     match = re.search(pattern, prediction, re.DOTALL)
     if match:
         return "answer", match.group(1).strip()
+    # fallback: check for 'Answer: \\boxed{...}'
+    boxed = extract_boxed_answer(prediction)
+    if boxed is not None:
+        return "answer", boxed
     return None, ""
 
 
