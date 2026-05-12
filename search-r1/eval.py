@@ -31,6 +31,16 @@ if str(SCRIPT_DIR) not in sys.path:
 
 
 def parse_args() -> argparse.Namespace:
+        parser.add_argument(
+            "--resume",
+            action="store_true",
+            help=(
+                "Resume from an existing --output JSONL: re-run only the timed-out or missing samples "
+                "per prompt (keeping non-timeout samples), and re-run all samples for prompts "
+                "whose samples were all timed out. The original output file is backed up to "
+                "<output>.bak before being overwritten."
+            ),
+        )
     parser = argparse.ArgumentParser(
         description=(
             "Evaluate a Search-R1 model against an already-running SGLang server "
@@ -419,6 +429,25 @@ def _apply_runtime_overrides(args: argparse.Namespace, runtime: Any) -> None:
 
 
 def main() -> None:
+        def _load_resume_records(output_path: Path) -> dict[int, dict[str, Any]]:
+            """Load an existing eval JSONL into {example_index: result_record}. Last one wins."""
+            records: dict[int, dict[str, Any]] = {}
+            if not output_path or not output_path.exists():
+                return records
+            with output_path.open("r", encoding="utf-8") as f:
+                for line_no, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as exc:
+                        print(f"[resume] skipping malformed line {line_no} in {output_path}: {exc}", flush=True)
+                        continue
+                    idx = rec.get("index")
+                    if isinstance(idx, int):
+                        records[idx] = rec
+            return records
     args = parse_args()
     tokenizer = _load_tokenizer(args.tokenizer_path or args.model_path)
     runtime = _load_runtime()
@@ -427,6 +456,17 @@ def main() -> None:
 
     dataset = _load_dataset_records(args)
     output_path = Path(args.output) if args.output else None
+
+
+    resume_records: dict[int, dict[str, Any]] = {}
+    if getattr(args, "resume", False):
+        assert output_path is not None
+        resume_records = _load_resume_records(output_path)
+        print(f"[resume] loaded {len(resume_records)} previous results from {output_path}", flush=True)
+        if output_path.exists():
+            backup_path = output_path.with_suffix(output_path.suffix + ".bak")
+            output_path.replace(backup_path)
+            print(f"[resume] backed up previous output to {backup_path}", flush=True)
 
     print(
         f"Connecting to SGLang server at http://{args.host}:{args.port} "
@@ -493,22 +533,71 @@ def main() -> None:
             nonlocal done_examples, num_correct, total_score
             nonlocal total_timeouts, examples_with_any_timeout
 
-
             messages = _row_messages(row)
             ground_truth = _row_ground_truth(row)
-            # Use the new tool-based format for prompt rendering
             prompt_text = runtime.format_conversation_with_tools(
                 prompt=messages,
                 system_prompt=None,
                 messages=None
             )
 
+            # Resume logic: figure out which sample indices need to be (re)run and which existing traces to keep as-is.
+            kept_traces: list[dict[str, Any]] = []
+            indices_to_run: list[int] = list(range(args.num_samples))
+            prev = resume_records.get(ex_index) if getattr(args, "resume", False) else None
+            if prev is not None:
+                prev_traces = prev.get("traces", []) or []
+                prev_by_index = {
+                    int(t.get("trace_index", -1)): t for t in prev_traces
+                    if isinstance(t.get("trace_index", None), int)
+                }
+                timed_out_indices = {
+                    i for i, t in prev_by_index.items() if t.get("timed_out", False)
+                }
+                all_timed_out_prev = (
+                    len(prev_by_index) > 0 and len(timed_out_indices) == len(prev_by_index)
+                )
+                if all_timed_out_prev:
+                    indices_to_run = list(range(args.num_samples))
+                    kept_traces = []
+                else:
+                    present_indices = set(prev_by_index.keys())
+                    rerun_set = set(timed_out_indices)
+                    for i in range(args.num_samples):
+                        if i not in present_indices:
+                            rerun_set.add(i)
+                    indices_to_run = sorted(rerun_set)
+                    kept_traces = [
+                        prev_by_index[i]
+                        for i in sorted(present_indices)
+                        if i < args.num_samples and i not in rerun_set
+                    ]
+                    if not indices_to_run:
+                        # Nothing to do for this example — emit the previous record verbatim.
+                        async with output_lock:
+                            done_examples += 1
+                            num_timeouts_prev = int(prev.get("num_timeouts", 0) or 0)
+                            num_correct += float(prev.get("avg_acc_excl_timeout", 0.0) or 0.0)
+                            total_score += float(prev.get("avg_score_excl_timeout", 0.0) or 0.0)
+                            total_timeouts += num_timeouts_prev
+                            if num_timeouts_prev > 0:
+                                examples_with_any_timeout += 1
+                            if output_file is not None:
+                                output_file.write(json.dumps(prev, ensure_ascii=False) + "\n")
+                                output_file.flush()
+                            running_acc = num_correct / done_examples if done_examples else 0.0
+                            print(
+                                f"[{done_examples}/{num_examples}] ex{ex_index} [resume:keep] timeouts={num_timeouts_prev}/{args.num_samples} running_acc={running_acc:.4f}",
+                                flush=True,
+                            )
+                        return
+
             generations = await asyncio.gather(*[
-                _safe_generate(ex_index, i, prompt_text) for i in range(args.num_samples)
+                _safe_generate(ex_index, i, prompt_text) for i in indices_to_run
             ])
 
-            traces: list[dict[str, Any]] = []
-            for sample_idx, generation in enumerate(generations):
+            new_traces: list[dict[str, Any]] = []
+            for sample_idx, generation in zip(indices_to_run, generations):
                 trace = _score_response(
                     grader, prompt_text, ground_truth, generation["response"],
                     runtime.SEARCH_R1_CONFIGS["format_score"],
@@ -521,9 +610,14 @@ def main() -> None:
                 if trace["timed_out"]:
                     trace["timeout_stage"] = generation.get("timeout_stage")
                     trace["timeout_turn"] = generation.get("timeout_turn")
-                traces.append(trace)
+                new_traces.append(trace)
                 if args.print_turns:
                     _print_trace_turns(ex_index, trace)
+
+            traces = sorted(
+                kept_traces + new_traces,
+                key=lambda t: int(t.get("trace_index", 0)),
+            )
 
             valid_traces = [t for t in traces if not t["timed_out"]]
             num_timeouts = len(traces) - len(valid_traces)
