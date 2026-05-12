@@ -1,3 +1,10 @@
+def extract_boxed_answer(prediction: str) -> str | None:
+    """Extracts the answer from any occurrence of \\boxed{...} (LaTeX style)."""
+    pattern = r"\\boxed\{([^}]*)\}"
+    matches = re.findall(pattern, prediction)
+    if matches:
+        return matches[-1].strip()
+    return None
 # Adapted from search-r1/generate_with_search.py.
 # This is the eval-only variant: we strip the slime-specific `generate()` /
 # `reward_func()` entry points so the file can be imported by `eval.py`
@@ -132,6 +139,10 @@ def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
     match = re.search(pattern, prediction, re.DOTALL)
     if match:
         return "answer", match.group(1).strip()
+    # fallback: check for \\boxed{...}
+    boxed = extract_boxed_answer(prediction)
+    if boxed is not None:
+        return "boxed_answer", boxed
     return None, ""
 
 
@@ -149,14 +160,14 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
             "</tool_response><|im_end|>\n<|im_start|>assistant\n"
         )
         return next_obs, False
-    if action == "answer":
+    if action == "answer" or action == "boxed_answer":
         return "", True
     # Move the invalid action message into a user message, matching retool style
     next_obs = (
         "<|im_start|>user\n"
         "Your previous action is invalid. "
         "If you want to use a tool, you should return a <tool_call>...</tool_call> block. "
-        "If you want to give the final answer, you should put the answer between <answer> and </answer>. "
+        "If you want to give the final answer, you should put the answer in \\boxed{{}}. "
         "Please try again.\n"
         "<|im_end|>\n<|im_start|>assistant\n"
     )
