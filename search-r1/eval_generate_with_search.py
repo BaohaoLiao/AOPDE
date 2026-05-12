@@ -151,12 +151,16 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
     """Run the action implied by `prediction`. Return (next_observation, done)."""
     action, content = postprocess_predictions(prediction)
     if action == "search":
-        async with SEMAPHORE:
-            search_results = await search(content)
+        try:
+            async with SEMAPHORE:
+                search_results = await search(content)
+            tool_response_content = search_results.strip()
+        except Exception as e:
+            tool_response_content = f"[ERROR] {type(e).__name__}: {e}"
         # Return as <tool_response> in user message, retool style
         next_obs = (
             "<|im_start|>user\n<tool_response>\n"
-            f"{search_results.strip()}\n"
+            f"{tool_response_content}\n"
             "</tool_response><|im_end|>\n<|im_start|>assistant\n"
         )
         return next_obs, False
