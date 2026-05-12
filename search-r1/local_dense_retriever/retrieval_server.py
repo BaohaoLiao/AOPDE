@@ -208,11 +208,14 @@ class DenseRetriever(BaseRetriever):
         self.index = faiss.read_index(self.index_path)
 
         if config.faiss_gpu:
-            co = faiss.GpuClonerOptions()
+            # Shard index across all visible GPUs (as set by CUDA_VISIBLE_DEVICES)
+            co = faiss.GpuMultipleClonerOptions()
             co.useFloat16 = True
-            res = faiss.StandardGpuResources()
-            # Always use device 0, since CUDA_VISIBLE_DEVICES is set per process
-            self.index = faiss.index_cpu_to_gpu(res, 0, self.index, co)
+            co.shard = True
+            num_gpus = torch.cuda.device_count()
+            res = [faiss.StandardGpuResources() for _ in range(num_gpus)]
+            device_list = list(range(num_gpus))
+            self.index = faiss.index_cpu_to_gpu_multiple(res, device_list, self.index, co)
 
         self.corpus = load_corpus(self.corpus_path)
         self.encoder = Encoder(
