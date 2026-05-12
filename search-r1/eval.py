@@ -581,25 +581,37 @@ def main() -> None:
             # Resume logic: figure out which sample indices need to be (re)run and which existing traces to keep as-is.
             kept_traces: list[dict[str, Any]] = []
             indices_to_run: list[int] = list(range(args.num_samples))
+            resume_rerun_note = ""
             prev = resume_records.get(ex_index) if getattr(args, "resume", False) else None
             if prev is not None:
                 prev_traces = prev.get("traces", []) or []
-                prev_by_index = {
-                    int(t.get("trace_index", -1)): t for t in prev_traces
-                    if isinstance(t.get("trace_index", None), int)
-                }
+                prev_by_index: dict[int, dict[str, Any]] = {}
+                for trace in prev_traces:
+                    trace_index = trace.get("trace_index")
+                    if not isinstance(trace_index, int):
+                        continue
+                    if 0 <= trace_index < args.num_samples:
+                        prev_by_index[int(trace_index)] = trace
                 timed_out_indices = {
                     i for i, t in prev_by_index.items() if t.get("timed_out", False)
                 }
-                all_timed_out_prev = (
-                    len(prev_by_index) > 0 and len(timed_out_indices) == len(prev_by_index)
+                search_error_indices = {
+                    i for i, t in prev_by_index.items() if _count_search_outcomes([t])[1] > 0
+                }
+                rerun_set = set(timed_out_indices) | set(search_error_indices)
+                if timed_out_indices or search_error_indices:
+                    resume_rerun_note = (
+                        f"resume_rerun_timeouts={len(timed_out_indices)} "
+                        f"resume_rerun_search_errors={len(search_error_indices)} "
+                    )
+                all_rerun_prev = (
+                    len(prev_by_index) > 0 and len(rerun_set) == len(prev_by_index)
                 )
-                if all_timed_out_prev:
+                if all_rerun_prev:
                     indices_to_run = list(range(args.num_samples))
                     kept_traces = []
                 else:
                     present_indices = set(prev_by_index.keys())
-                    rerun_set = set(timed_out_indices)
                     for i in range(args.num_samples):
                         if i not in present_indices:
                             rerun_set.add(i)
@@ -718,6 +730,7 @@ def main() -> None:
                 print(
                     f"[{done_examples}/{num_examples}] ex{ex_index} "
                     f"data_source={row.get('data_source')} "
+                    f"{resume_rerun_note}"
                     f"avg_acc_excl_timeout={avg_acc_excl_timeout:.3f} "
                     f"timeouts={num_timeouts}/{args.num_samples} "
                     f"empty_search={empty_search_results} "
