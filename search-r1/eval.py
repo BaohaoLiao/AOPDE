@@ -293,8 +293,7 @@ async def _generate_one_with_search(
                     "temperature": args.temperature,
                     "top_p": args.top_p,
                     "max_new_tokens": turn_max_new,
-                    # Stop right after the model emits a tool call or final answer.
-                    "stop": ["</tool_call>", "</answer>"],
+                    "stop": ["</answer>"],
                 },
             }
             if args.debug_trace:

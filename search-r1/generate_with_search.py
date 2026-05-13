@@ -346,7 +346,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             break
         remaining_context = max_context_length - total_length
         turn_sampling_params = dict(sampling_params)
-        turn_sampling_params["stop"] = ["</tool_call>", "</answer>"]
+        turn_sampling_params["stop"] = ["</answer>"]
         turn_sampling_params["max_new_tokens"] = min(
             turn_sampling_params.get("max_new_tokens", remaining_context),
             remaining_context,
