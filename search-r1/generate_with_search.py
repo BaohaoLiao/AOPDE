@@ -114,7 +114,49 @@ def _extract_tool_response_content(observation: str) -> str | None:
     match = re.search(r"<tool_response>\s*(.*?)\s*</tool_response>", observation, re.DOTALL)
     if match:
         return match.group(1).strip()
+    start_tag = "<tool_response>"
+    start = observation.find(start_tag)
+    if start != -1:
+        return observation[start + len(start_tag):].strip()
     return None
+
+
+def _truncate_text_to_token_budget(tokenizer, text: str, remaining_tokens: int) -> tuple[str, list[int], bool]:
+    if remaining_tokens <= 0:
+        return "", [], True
+    token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+    if len(token_ids) <= remaining_tokens:
+        return text, token_ids, False
+    truncated_ids = token_ids[:remaining_tokens]
+    truncated_text = tokenizer.decode(truncated_ids, skip_special_tokens=False)
+    return truncated_text, truncated_ids, True
+
+
+def _apply_final_token_clip(
+    tokenizer,
+    prompt_token_ids: list[int],
+    response_token_ids: list[int],
+    loss_mask: list[int],
+    rollout_log_probs: list[float] | None,
+    max_context_length: int,
+) -> tuple[list[int], str, list[int], list[int], list[float] | None, bool]:
+    max_response_tokens = max(0, max_context_length - len(prompt_token_ids))
+    if len(response_token_ids) <= max_response_tokens:
+        response_text = tokenizer.decode(response_token_ids, skip_special_tokens=False)
+        return prompt_token_ids + response_token_ids, response_text, response_token_ids, loss_mask, rollout_log_probs, False
+
+    clipped_response_token_ids = response_token_ids[:max_response_tokens]
+    clipped_loss_mask = loss_mask[:max_response_tokens]
+    clipped_log_probs = rollout_log_probs[:max_response_tokens] if rollout_log_probs is not None else None
+    clipped_response = tokenizer.decode(clipped_response_token_ids, skip_special_tokens=False)
+    return (
+        prompt_token_ids + clipped_response_token_ids,
+        clipped_response,
+        clipped_response_token_ids,
+        clipped_loss_mask,
+        clipped_log_probs,
+        True,
+    )
 
 
 def _initial_trace_messages(raw_prompt: str) -> list[dict[str, str]]:
@@ -274,16 +316,44 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     # Set up the initial prompt with the same system/tool instructions used by eval.
     prompt_text = format_conversation_with_tools(sample.prompt)
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+    max_context_length = args.rollout_max_response_len - 16
+    max_tokens_per_gpu = getattr(args, "max_tokens_per_gpu", None)
+    if max_tokens_per_gpu is not None:
+        max_context_length = min(max_context_length, args.context_parallel_size * max_tokens_per_gpu - 16)
+    if len(prompt_tokens_ids) >= max_context_length:
+        sample.tokens = prompt_tokens_ids[:max_context_length]
+        sample.response_length = 0
+        sample.response = ""
+        sample.loss_mask = []
+        sample.prompt = state.tokenizer.decode(sample.tokens, skip_special_tokens=False)
+        sample.status = Sample.Status.TRUNCATED
+        return sample
+
     response = ""
     response_token_ids = []
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
     messages = _initial_trace_messages(sample.prompt)
     search_count = 0
+    observation_truncated = False
+    final_was_clipped = False
+    last_finish_reason = None
 
     for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
+        total_length = len(prompt_tokens_ids) + len(response_token_ids)
+        if total_length >= max_context_length:
+            sample.status = Sample.Status.TRUNCATED
+            break
+        remaining_context = max_context_length - total_length
         turn_sampling_params = dict(sampling_params)
         turn_sampling_params["stop"] = ["</tool_call>", "</answer>"]
+        turn_sampling_params["max_new_tokens"] = min(
+            turn_sampling_params.get("max_new_tokens", remaining_context),
+            remaining_context,
+        )
+        if turn_sampling_params["max_new_tokens"] <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            break
         payload = {
             "text": prompt_text + response,
             "sampling_params": turn_sampling_params,
@@ -293,9 +363,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             payload["return_logprob"] = True
 
         output = await post(url, payload)
+        last_finish_reason = output["meta_info"]["finish_reason"]["type"]
 
         # abort
-        if output["meta_info"]["finish_reason"]["type"] == "abort":
+        if last_finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
             return sample
 
@@ -330,19 +401,32 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if SEARCH_R1_CONFIGS["return_logprob"]:
             rollout_log_probs += cur_response_log_probs
 
-        if output["meta_info"]["finish_reason"]["type"] == "length":
+        if last_finish_reason == "length":
+            sample.status = Sample.Status.TRUNCATED
             break
 
         next_obs, done = await execute_predictions(cur_response)
         if done:
             break
         tool_response_content = _extract_tool_response_content(next_obs)
-        if tool_response_content is not None:
-            messages.append({"role": "tool", "content": tool_response_content})
-            search_count += 1
 
         assert next_obs != "", "Next observation should not be empty."
-        obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+        remaining_observation_tokens = max_context_length - (len(prompt_tokens_ids) + len(response_token_ids))
+        if remaining_observation_tokens <= 0:
+            sample.status = Sample.Status.TRUNCATED
+            break
+        next_obs, obs_tokens_ids, obs_was_truncated = _truncate_text_to_token_budget(
+            state.tokenizer,
+            next_obs,
+            remaining_observation_tokens,
+        )
+        if obs_was_truncated:
+            observation_truncated = True
+            sample.status = Sample.Status.TRUNCATED
+        if tool_response_content is not None:
+            truncated_tool_response_content = _extract_tool_response_content(next_obs) or ""
+            messages.append({"role": "tool", "content": truncated_tool_response_content})
+            search_count += 1
         response += next_obs
         response_token_ids += obs_tokens_ids
         loss_mask += [0] * len(obs_tokens_ids)
@@ -355,15 +439,33 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             assert len(response_token_ids) == len(
                 rollout_log_probs
             ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
+        if obs_was_truncated:
+            break
 
     # Store statistics for wandb logging
-    sample.tokens = prompt_tokens_ids + response_token_ids
-    sample.response_length = len(response_token_ids)
-    sample.response = response
-    sample.loss_mask = loss_mask
+    (
+        final_tokens,
+        final_response,
+        final_response_token_ids,
+        final_loss_mask,
+        final_rollout_log_probs,
+        final_was_clipped,
+    ) = _apply_final_token_clip(
+        state.tokenizer,
+        prompt_tokens_ids,
+        response_token_ids,
+        loss_mask,
+        rollout_log_probs,
+        max_context_length,
+    )
+
+    sample.tokens = final_tokens
+    sample.response_length = len(final_response_token_ids)
+    sample.response = final_response
+    sample.loss_mask = final_loss_mask
     sample.prompt = prompt_text
     sample.messages = messages
-    sample.payload_text = prompt_text + response
+    sample.payload_text = prompt_text + final_response
     sample.payload_has_system = "<|im_start|>system" in sample.payload_text
     sample.payload_has_tools = "# Tools" in sample.payload_text
     sample.tool_call_count = search_count
@@ -376,18 +478,25 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.metadata["payload_has_tools"] = sample.payload_has_tools
     sample.metadata["tool_call_count"] = search_count
     sample.metadata["search_count"] = search_count
+    sample.metadata["max_context_length"] = max_context_length
+    sample.metadata["observation_truncated"] = observation_truncated
+    sample.metadata["final_was_clipped"] = final_was_clipped
 
     # Store log probs if enabled
     if SEARCH_R1_CONFIGS["return_logprob"]:
-        sample.rollout_log_probs = rollout_log_probs if rollout_log_probs else None
+        sample.rollout_log_probs = final_rollout_log_probs if final_rollout_log_probs else None
 
-    match output["meta_info"]["finish_reason"]["type"]:
-        case "length":
-            sample.status = Sample.Status.TRUNCATED
-        case "abort":
-            sample.status = Sample.Status.ABORTED
-        case "stop":
-            sample.status = Sample.Status.COMPLETED
+    if final_was_clipped:
+        sample.status = Sample.Status.TRUNCATED
+
+    if sample.status == Sample.Status.PENDING:
+        match last_finish_reason:
+            case "length":
+                sample.status = Sample.Status.TRUNCATED
+            case "abort":
+                sample.status = Sample.Status.ABORTED
+            case "stop":
+                sample.status = Sample.Status.COMPLETED
 
     return sample
 
