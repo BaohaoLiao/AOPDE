@@ -12,6 +12,28 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
+# System prompt and tool definition, matched with eval_generate_with_search.py.
+DEFAULT_SYSTEM_PROMPT = (
+    "You are a helpful assistant that can use tools to answer questions. "
+    "You have access to a search tool. When you need to look up information, "
+    "call the search tool as described below."
+)
+
+TOOL_SYSTEM_PROMPT = """# Tools
+
+You may call one function at a time to assist with the user query.
+
+You are provided with function signatures within <tools></tools> XML tags:
+<tools>
+<tool name=\"search\" description=\"Search for information.\" args=\"{\\\"query\\\": string}\" />
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
+After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
+<tool_call>
+{"name": "search", "arguments": {"query": "..."}}
+</tool_call>"""
+
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
@@ -44,6 +66,41 @@ SEARCH_R1_CONFIGS = {
 
 
 SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
+
+
+def _tool_system_content() -> str:
+    return f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT}"
+
+
+def _system_block() -> str:
+    return f"<|im_start|>system\n{_tool_system_content()}<|im_end|>\n"
+
+
+def format_conversation_with_tools(prompt: str) -> str:
+    """Add the eval-style system/tool prompt to a raw or already-rendered prompt."""
+    if TOOL_SYSTEM_PROMPT in prompt or '<tool name="search"' in prompt:
+        return prompt
+
+    if prompt.startswith("<|im_start|>system"):
+        end_tag = "<|im_end|>"
+        end = prompt.find(end_tag)
+        if end != -1:
+            system_content_end = end
+            return (
+                prompt[:system_content_end].rstrip()
+                + "\n\n"
+                + TOOL_SYSTEM_PROMPT
+                + prompt[system_content_end:]
+            )
+
+    if "<|im_start|>user" in prompt:
+        return _system_block() + prompt
+
+    return (
+        _system_block()
+        + f"<|im_start|>user\n{prompt}<|im_end|>\n"
+        + "<|im_start|>assistant\n"
+    )
 
 
 def _passages2string(retrieval_result):
@@ -193,8 +250,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # Handle partial rollout samples: continue generation from existing response
-    prompt_text = sample.prompt
+    # Set up the initial prompt with the same system/tool instructions used by eval.
+    prompt_text = format_conversation_with_tools(sample.prompt)
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     response = ""
     response_token_ids = []
