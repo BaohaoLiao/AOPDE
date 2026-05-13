@@ -36,7 +36,7 @@ You are provided with function signatures within <tools></tools> XML tags:
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
 After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
 <tool_call>
-{"name": "search", "arguments": {"query": "..."}}
+{"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
 
 SEARCH_R1_CONFIGS = {

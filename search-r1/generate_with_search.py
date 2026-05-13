@@ -31,7 +31,7 @@ You are provided with function signatures within <tools></tools> XML tags:
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
 After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
 <tool_call>
-{"name": "search", "arguments": {"query": "..."}}
+{"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
 
 # Configuration for Search-R1
@@ -101,6 +101,27 @@ def format_conversation_with_tools(prompt: str) -> str:
         + f"<|im_start|>user\n{prompt}<|im_end|>\n"
         + "<|im_start|>assistant\n"
     )
+
+
+def _extract_user_messages(prompt: str) -> list[str]:
+    matches = re.findall(r"<\|im_start\|>user\s*(.*?)<\|im_end\|>", prompt, re.DOTALL)
+    if matches:
+        return [match.strip() for match in matches if match.strip()]
+    return [prompt.strip()] if prompt.strip() else []
+
+
+def _extract_tool_response_content(observation: str) -> str | None:
+    match = re.search(r"<tool_response>\s*(.*?)\s*</tool_response>", observation, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def _initial_trace_messages(raw_prompt: str) -> list[dict[str, str]]:
+    messages = [{"role": "system", "content": _tool_system_content()}]
+    for content in _extract_user_messages(raw_prompt):
+        messages.append({"role": "user", "content": content})
+    return messages
 
 
 def _passages2string(retrieval_result):
@@ -257,6 +278,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     response_token_ids = []
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
+    messages = _initial_trace_messages(sample.prompt)
+    search_count = 0
 
     for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
         turn_sampling_params = dict(sampling_params)
@@ -301,6 +324,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response += cur_response
         response_token_ids += cur_response_token_ids
         loss_mask += [1] * len(cur_response_token_ids)
+        messages.append({"role": "assistant", "content": cur_response})
 
         # Add log probs if enabled
         if SEARCH_R1_CONFIGS["return_logprob"]:
@@ -312,6 +336,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         next_obs, done = await execute_predictions(cur_response)
         if done:
             break
+        tool_response_content = _extract_tool_response_content(next_obs)
+        if tool_response_content is not None:
+            messages.append({"role": "tool", "content": tool_response_content})
+            search_count += 1
 
         assert next_obs != "", "Next observation should not be empty."
         obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
@@ -334,6 +362,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.response = response
     sample.loss_mask = loss_mask
     sample.prompt = prompt_text
+    sample.messages = messages
+    sample.payload_text = prompt_text + response
+    sample.payload_has_system = "<|im_start|>system" in sample.payload_text
+    sample.payload_has_tools = "# Tools" in sample.payload_text
+    sample.tool_call_count = search_count
+    sample.search_count = search_count
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["messages"] = messages
+    sample.metadata["payload_text"] = sample.payload_text
+    sample.metadata["payload_has_system"] = sample.payload_has_system
+    sample.metadata["payload_has_tools"] = sample.payload_has_tools
+    sample.metadata["tool_call_count"] = search_count
+    sample.metadata["search_count"] = search_count
 
     # Store log probs if enabled
     if SEARCH_R1_CONFIGS["return_logprob"]:
