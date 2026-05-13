@@ -18,6 +18,9 @@ export PYTHONBUFFERED=16
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 source "${SCRIPT_DIR}/../../scripts/models/qwen2.5-3B.sh"
 
+# Comma-separated local retriever URLs. Override from the shell if needed.
+SEARCH_URL=${SEARCH_URL:-"http://127.0.0.1:8000/retrieve,http://127.0.0.1:8001/retrieve"}
+
 CKPT_ARGS=(
    --hf-checkpoint /root/Qwen2.5-3B/
    --ref-load /root/Qwen2.5-3B_torch_dist/
@@ -128,7 +131,8 @@ ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-s
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"/root/Megatron-LM/:${SCRIPT_DIR}\",
-    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\"
+    \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
+    \"SEARCH_URL\": \"${SEARCH_URL}\"
   }
 }"
 

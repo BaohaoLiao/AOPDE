@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+import os
 import re
 
 from qa_em_format import compute_score_em
@@ -22,7 +23,10 @@ SEARCH_R1_CONFIGS = {
     # ============== Local Search Configuration ==============
     # (Only used when search_backend="local")
     "local": {
-        "search_url": "http://127.0.0.1:8000/retrieve",  # Comma-separate multiple local retriever URLs.
+        "search_url": os.environ.get(
+            "SEARCH_URL",
+            "http://127.0.0.1:8000/retrieve",
+        ),  # Comma-separate multiple local retriever URLs.
         "proxy": None,  # Set to your proxy if needed
     },
     # ============== Google Search Configuration ==============
