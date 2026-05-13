@@ -2,6 +2,7 @@
 # This is a unified version supporting both local search and Google search, with optional log probability collection
 
 import asyncio
+import json
 import re
 
 from qa_em_format import compute_score_em
@@ -13,7 +14,7 @@ from slime.utils.types import Sample
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 2,
+    "max_turns": 4,
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
@@ -90,53 +91,92 @@ async def search(query: str) -> str:
     return _passages2string(result)
 
 
-# IMPORTANT: When we need to collect log probabilities (logp), we CANNOT do any postprocessing
-# on the strings returned from the inference engine (sglang). This is because:
-# 1. We don't know how to truncate the corresponding tokens/logp arrays to match the modified string
-# 2. Re-tokenizing the postprocessed string may produce different tokens than what the engine generated,
-#    leading to misalignment between tokens and their log probabilities
+def extract_boxed_answer(prediction: str) -> str | None:
+    """Extract the final answer from the last LaTeX-style \boxed{...}, if present."""
+    matches = re.findall(r"\\boxed\{([^}]*)\}", prediction)
+    if matches:
+        return matches[-1].strip()
+    return None
+
+
+# IMPORTANT: When we need to collect log probabilities (logp), we CANNOT change
+# strings returned from SGLang because token/logp arrays would no longer align.
 # Therefore, postprocess_responses is only used when return_logprob=False.
 def postprocess_responses(resp: str) -> str:
     """
     Post-process response to ensure tag completeness.
     Only used when SEARCH_R1_CONFIGS["return_logprob"] is False.
     """
-    return (
-        resp.split("</search>")[0] + "</search>"
-        if "</search>" in resp
-        else resp.split("</answer>")[0] + "</answer>" if "</answer>" in resp else resp
-    )
+    if "</tool_call>" in resp:
+        return resp.split("</tool_call>")[0] + "</tool_call>"
+    if "</answer>" in resp:
+        return resp.split("</answer>")[0] + "</answer>"
+    return resp
 
 
-def postprocess_predictions(prediction: str):
-    pattern = r"<(search|answer)>(.*?)</\1>"
-    match = re.search(pattern, prediction, re.DOTALL)
+def _extract_first_tool_call(prediction: str) -> dict | None:
+    tool_call_pattern = r"<tool_call>\s*(.*?)\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, prediction, re.DOTALL)
+    if not tool_call_match:
+        return None
+    try:
+        json_str = tool_call_match.group(1).replace("\n", "\\n")
+        tool_call_data = json.loads(json_str)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(tool_call_data, dict):
+        return None
+    return tool_call_data
+
+
+def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
+    """Return (action, content) where action is 'search'|'answer'|'boxed_answer'|None."""
+    tool_call = _extract_first_tool_call(prediction)
+    if tool_call and tool_call.get("name") == "search":
+        arguments = tool_call.get("arguments", {})
+        if isinstance(arguments, dict):
+            return "search", str(arguments.get("query", ""))
+        return "search", ""
+
+    match = re.search(r"<answer>(.*?)</answer>", prediction, re.DOTALL)
     if match:
-        content = match.group(2).strip()  # Return only the content inside the tags
-        action = match.group(1)
-    else:
-        content = ""
-        action = None
+        return "answer", match.group(1).strip()
 
-    return action, content
+    boxed = extract_boxed_answer(prediction)
+    if boxed is not None:
+        return "boxed_answer", boxed
+
+    return None, ""
 
 
 async def execute_predictions(prediction: str) -> str:
     action, content = postprocess_predictions(prediction)
 
     if action == "search":
-        search_query = content
-        async with SEMAPHORE:
-            search_results = await search(search_query)
-        next_obs = f"\n\n<information>{search_results.strip()}</information>\n\n"
+        try:
+            async with SEMAPHORE:
+                search_results = await search(content)
+            tool_response_content = search_results.strip()
+        except Exception as e:
+            tool_response_content = f"[ERROR] {type(e).__name__}: {e}"
+        next_obs = (
+            "<|im_start|>user\n<tool_response>\n"
+            f"{tool_response_content}\n"
+            "</tool_response><|im_end|>\n<|im_start|>assistant\n"
+        )
         done = False
-    elif action == "answer":
+    elif action == "answer" or action == "boxed_answer":
         next_obs = ""
         done = True
     else:
-        next_obs = "\nMy previous action is invalid. \
-If I want to search, I should put the query between <search> and </search>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n"
+        next_obs = (
+            "<|im_start|>user\n"
+            "Your previous action is invalid. "
+            "If you want to use a tool, you should return a <tool_call>...</tool_call> block. "
+            "If you want to give the final answer, you should put the answer in \\boxed{{}}. "
+            "Please try again.\n"
+            "<|im_end|>\n<|im_start|>assistant\n"
+        )
         done = False
 
     return next_obs, done
@@ -158,9 +198,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
 
     for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
+        turn_sampling_params = dict(sampling_params)
+        turn_sampling_params["stop"] = ["</tool_call>", "</answer>"]
         payload = {
             "text": prompt_text + response,
-            "sampling_params": sampling_params,
+            "sampling_params": turn_sampling_params,
         }
         # Add log probability collection if enabled
         if SEARCH_R1_CONFIGS["return_logprob"]:

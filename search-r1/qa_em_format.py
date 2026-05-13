@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import random
+import json
 import re
 import string
 
@@ -49,6 +50,10 @@ def em_check(prediction, golden_answers):
 
 
 def is_valid_sequence(text):
+    tool_valid, tool_reason = is_valid_tool_sequence(text)
+    if tool_valid:
+        return True, tool_reason
+
     # Find the position of "<|im_start|>assistant" with potential whitespace
     assistant_pattern = r"<\|im_start\|>assistant\s*"
     assistant_match = re.search(assistant_pattern, text)
@@ -123,6 +128,51 @@ def is_valid_sequence(text):
     return True, "Valid sequence format"
 
 
+def _tool_response_contents(text: str) -> list[str]:
+    pattern = r"<tool_response>\s*(.*?)\s*</tool_response>"
+    return [match.strip() for match in re.findall(pattern, text, re.DOTALL)]
+
+
+def _extract_tool_calls(text: str) -> list[dict]:
+    calls = []
+    for payload in re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
+        try:
+            call = json.loads(payload.replace("\n", "\\n"))
+        except Exception:
+            continue
+        if isinstance(call, dict):
+            calls.append(call)
+    return calls
+
+
+def is_valid_tool_sequence(text):
+    assistant_pattern = r"<\|im_start\|>assistant\s*"
+    assistant_match = re.search(assistant_pattern, text)
+    if not assistant_match:
+        return False, "Missing assistant marker"
+
+    content = text[assistant_match.end():]
+    tool_open = len(re.findall(r"<tool_call>", content))
+    tool_close = len(re.findall(r"</tool_call>", content))
+    response_open = len(re.findall(r"<tool_response>", content))
+    response_close = len(re.findall(r"</tool_response>", content))
+    if tool_open != tool_close:
+        return False, f"Mismatch in tool_call tags: {tool_open} opening vs {tool_close} closing tags"
+    if response_open != response_close:
+        return False, f"Mismatch in tool_response tags: {response_open} opening vs {response_close} closing tags"
+
+    tool_calls = _extract_tool_calls(content)
+    if len(tool_calls) != tool_open:
+        return False, "Invalid tool_call JSON"
+    if any(call.get("name") != "search" for call in tool_calls):
+        return False, "Unexpected tool name"
+    if len(tool_calls) != len(_tool_response_contents(content)):
+        return False, "tool_call/tool_response count mismatch"
+    if extract_solution(text) is None:
+        return False, "Missing final answer"
+    return True, "Valid tool-call sequence format"
+
+
 def extract_solution(solution_str):
     """Extract the equation from the solution string."""
 
@@ -130,7 +180,7 @@ def extract_solution(solution_str):
     answer_pattern = r"<answer>(.*?)</answer>"
     match = re.finditer(answer_pattern, solution_str, re.DOTALL)
     matches = list(match)
-    if len(matches) > 1:
+    if matches:
         return matches[-1].group(1).strip()
     # If not found, try \\boxed{...}
     boxed_pattern = r"\\boxed\{([^}]*)\}"
@@ -141,9 +191,9 @@ def extract_solution(solution_str):
 
 
 def extract_information_blocks(text: str) -> list[str]:
-    pattern = r"<information>(.*?)</information>"
-    matches = re.findall(pattern, text, re.DOTALL)
-    return [match.strip() for match in matches]
+    information = re.findall(r"<information>(.*?)</information>", text, re.DOTALL)
+    tool_responses = _tool_response_contents(text)
+    return [match.strip() for match in information + tool_responses]
 
 
 def is_retrieval_correct(text: str, golden_answers: list[str]) -> list[str]:
