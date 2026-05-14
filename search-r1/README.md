@@ -263,8 +263,20 @@ Create and activate a conda environment with Python 3.10:
 
 ```bash
 # Create environment
-conda create -n retriever python=3.10 -y
-conda activate retriever
+# conda create -n retriever python=3.10 -y
+# conda activate retriever
+
+mkdir -p /mount/coreai-genai-pvc/baliao/home/.cache/conda
+mkdir -p /mount/coreai-genai-pvc/baliao/home/.conda/pkgs
+mkdir -p /mount/coreai-genai-pvc/baliao/home/.conda/envs
+
+export HOME=/mount/coreai-genai-pvc/baliao/home
+export XDG_CACHE_HOME=/mount/coreai-genai-pvc/baliao/home/.cache
+export CONDA_PKGS_DIRS=/mount/coreai-genai-pvc/baliao/home/.conda/pkgs
+export CONDA_ENVS_PATH=/mount/coreai-genai-pvc/baliao/home/.conda/envs
+
+conda create -p /mount/coreai-genai-pvc/baliao/home/.conda/envs/retriever python=3.10 -y
+conda activate /mount/coreai-genai-pvc/baliao/home/.conda/envs/retriever
 
 # Install PyTorch with CUDA support
 conda install pytorch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 pytorch-cuda=12.1 -c pytorch -c nvidia -y
@@ -390,7 +402,9 @@ python /root/slime/examples/search-r1/local_dense_retriever/retrieval_server.py 
 - Normal startup time (excluding downloads): 1-2 minutes
 - GPU memory usage per GPU: approximately 5-7 GB
 - The local search engine's Python process will not terminate when the shell closes
-- To restart the server: `lsof -i :8000` to find the PID, then kill it and restart
+- To restart the server: `lsof -i :8000` (`ss -ltnp 'sport = :8000'
+ss -ltnp 'sport = :8001'
+`) to find the PID, then kill it and restart
 
 ### Step 5: Start Training
 
