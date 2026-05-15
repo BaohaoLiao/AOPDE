@@ -20,7 +20,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
     "tools to solve mathematical problems. When you need "
     "to perform calculations, use the code_interpreter "
-    "tool to execute code and get results."
+    "tool to execute code and get results. Please use print() to output the code results so they can be captured by the tool."
 )
 
 TOOL_SYSTEM_PROMPT = """# Tools

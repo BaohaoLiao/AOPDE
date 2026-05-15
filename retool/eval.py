@@ -696,7 +696,7 @@ def main() -> None:
             async def _process_example(ex_index: int, row: dict[str, Any]) -> None:
                 nonlocal done_examples, num_correct, total_score, total_timeouts, examples_with_any_timeout
                 prompt = _ensure_dapo_wrap(row["problem"])
-                label = str(row.get("gt") or row.get("label", ""))
+                label = str(row.get("gt", ""))
 
                 # Resume logic: figure out which sample indices need to be (re)run
                 # and which existing traces to keep as-is.
