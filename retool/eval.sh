@@ -23,6 +23,7 @@ OUTPUT=${OUTPUT:-${MODEL_PATH}/eval_aime2024.jsonl}
 SUMMARY_OUTPUT=${SUMMARY_OUTPUT:-${MODEL_PATH}/eval_aime2024_summary.json}
 SAMPLE_TIMEOUT=${SAMPLE_TIMEOUT:-1800}
 SERVER_WAIT_TIMEOUT=${SERVER_WAIT_TIMEOUT:-60}
+STOP_WORD=${STOP_WORD:-"</tool_call>"}
 
 export TOOL_SANDBOX_BACKEND=${TOOL_SANDBOX_BACKEND:-"subprocess"}
 export TOOL_SANDBOX_CONCURRENCY=${TOOL_SANDBOX_CONCURRENCY:-"32"}
@@ -38,6 +39,7 @@ python eval.py \
     --dataset "${DATA_DIR}/aime-2024/aime-2024.jsonl" \
     --num-samples ${NUM_SAMPLES} \
     --max-new-tokens ${MAX_NEW_TOKENS} \
+    --stop "${STOP_WORD}" \
     --temperature 1.0 \
     --top-p 1.0 \
     --host "${HOST}" \

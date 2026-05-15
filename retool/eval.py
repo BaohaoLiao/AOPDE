@@ -58,6 +58,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--request-timeout", type=int, default=1800, help="HTTP timeout per generation request")
     parser.add_argument("--max-new-tokens", type=int, default=16384, help="Max new tokens per sample")
     parser.add_argument(
+        "--stop",
+        type=str,
+        nargs="+",
+        default=None,
+        help=(
+            "Optional SGLang stop string(s). Use --stop '</tool_call>' to stop "
+            "as soon as a complete tool call is emitted. Stop strings are kept "
+            "in returned text via no_stop_trim=True so tool parsing still works."
+        ),
+    )
+    parser.add_argument(
         "--max-context-len",
         type=int,
         default=16384,
@@ -322,6 +333,8 @@ def _generate_one(args: argparse.Namespace, tokenizer: Any, prompt: Any) -> str:
             "temperature": args.temperature,
             "top_p": args.top_p,
             "max_new_tokens": args.max_new_tokens,
+            "stop": args.stop,
+            "no_stop_trim": True,
         },
     }
     url = f"http://{args.host}:{args.port}/generate"
@@ -390,6 +403,8 @@ async def _generate_one_with_tools(
                     "temperature": args.temperature,
                     "top_p": args.top_p,
                     "max_new_tokens": turn_max_new,
+                    "stop": args.stop,
+                    "no_stop_trim": True,
                 },
             }
             if args.debug_trace:
