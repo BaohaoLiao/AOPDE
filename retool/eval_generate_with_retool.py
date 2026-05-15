@@ -20,7 +20,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
     "tools to solve mathematical problems. When you need "
     "to perform calculations, use the code_interpreter "
-    "tool to execute code and get results. Please use print() to output the code results so they can be captured by the tool."
+    "tool to execute code and get results."
 )
 
 TOOL_SYSTEM_PROMPT = """# Tools
@@ -34,6 +34,7 @@ __TOOLS__
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags.
 After a tool is executed, you will receive the tool result in a user message wrapped in <tool_response></tool_response> tags.
+Please use print() to output the code results so they can be shown to you.
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
 </tool_call>"""
