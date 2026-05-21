@@ -279,6 +279,7 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     raw_rewards = []
     task_counts = {"retool": 0, "search-r1": 0}
     failed_teachers = {"retool": 0, "search-r1": 0}
+    has_round_number = any(sample.metadata and "round_number" in sample.metadata for sample in samples)
 
     for sample in samples:
         task = getattr(sample, "_opd_task", None) or _get_task(sample)
@@ -289,6 +290,8 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         sample.teacher_log_probs = _extract_teacher_log_probs(sample)
         sample.metadata = _metadata(sample)
         sample.metadata["task"] = task
+        if has_round_number:
+            sample.metadata.setdefault("round_number", 0)
 
         raw_rewards.append(float(getattr(sample, "_opd_task_score", 0.0) or 0.0))
 
