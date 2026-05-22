@@ -159,7 +159,7 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
             tool_response_content = f"[ERROR] {type(e).__name__}: {e}"
         # Return as <tool_response> in user message, retool style
         next_obs = (
-            "<|im_start|>user\n<tool_response>\n"
+            "<|im_end|>\n<|im_start|>user\n<tool_response>\n"
             f"{tool_response_content}\n"
             "</tool_response><|im_end|>\n<|im_start|>assistant\n"
         )
@@ -168,7 +168,7 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
         return "", True
     # Move the invalid action message into a user message, matching retool style
     next_obs = (
-        "<|im_start|>user\n"
+        "<|im_end|>\n<|im_start|>user\n"
         "Your previous action is invalid. "
         "If you want to use a tool, you should return a <tool_call>...</tool_call> block. "
         "If you want to give the final answer, you should put the answer in \\boxed{{}}. "
