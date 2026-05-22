@@ -73,6 +73,11 @@ _OPD_MIX_PROMPT_ASSISTANT = os.environ.get("SEARCH_OPD_MIX_PROMPT_ASSISTANT", "0
 _OPD_REV_TURN_DECAY_ALPHA = float(os.environ.get("SEARCH_OPD_REV_TURN_DECAY", "0.8"))
 
 
+def _is_pure_opd_v1(args) -> bool:
+    custom_rm_path = str(getattr(args, "custom_rm_path", "") or "")
+    return custom_rm_path.endswith("on_policy_distillation.reward_func")
+
+
 def _compute_normalized_turn_weight(k: int, K: int, alpha: float) -> float:
     if K <= 1 or alpha >= 1.0:
         return 1.0
@@ -634,6 +639,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         action, _ = postprocess_predictions(cur_response)
         if last_finish_reason == "length" and action not in {"search", "answer", "boxed_answer"}:
             sample.status = Sample.Status.TRUNCATED
+            break
+
+        if action == "search" and SEARCH_R1_CONFIGS["max_turns"] <= 1 and _is_pure_opd_v1(args):
             break
 
         next_obs, done = await execute_predictions(cur_response)
