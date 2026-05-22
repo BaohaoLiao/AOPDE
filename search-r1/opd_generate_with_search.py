@@ -38,7 +38,7 @@ After a tool is executed, you will receive the tool result in a user message wra
 # Configuration for Search-R1
 SEARCH_R1_CONFIGS = {
     # ============== General Configuration ==============
-    "max_turns": 4,
+    "max_turns": int(os.environ.get("SEARCH_R1_MAX_TURNS", "4")),
     "topk": 3,
     "search_concurrency": 256,
     # ============== Search Backend Selection ==============
