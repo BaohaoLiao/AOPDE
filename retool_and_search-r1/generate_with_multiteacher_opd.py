@@ -277,12 +277,15 @@ def _normalize_rewards(args, rewards: list[float]) -> list[float]:
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
     raw_rewards = []
+    sample_tasks = []
     task_counts = {"retool": 0, "search-r1": 0}
+    task_raw_rewards = {"retool": [], "search-r1": []}
     failed_teachers = {"retool": 0, "search-r1": 0}
     has_round_number = any(sample.metadata and "round_number" in sample.metadata for sample in samples)
 
     for sample in samples:
         task = getattr(sample, "_opd_task", None) or _get_task(sample)
+        sample_tasks.append(task)
         task_counts[task] += 1
         if getattr(sample, "_opd_teacher_response", None) is None:
             failed_teachers[task] += 1
@@ -293,7 +296,9 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         if has_round_number:
             sample.metadata.setdefault("round_number", 0)
 
-        raw_rewards.append(float(getattr(sample, "_opd_task_score", 0.0) or 0.0))
+        raw_reward = float(getattr(sample, "_opd_task_score", 0.0) or 0.0)
+        raw_rewards.append(raw_reward)
+        task_raw_rewards[task].append(raw_reward)
 
     if any(failed_teachers.values()):
         print(
@@ -302,25 +307,42 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
             flush=True,
         )
 
+    train_rewards = _normalize_rewards(args, raw_rewards)
+    task_train_rewards = {"retool": [], "search-r1": []}
+    for task, reward in zip(sample_tasks, train_rewards, strict=False):
+        task_train_rewards[task].append(float(reward))
+
+    def mean(values: list[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    log_metrics = {
+        "rollout/student_task_score": mean(raw_rewards),
+        "rollout/retool_count": task_counts["retool"],
+        "rollout/search_r1_count": task_counts["search-r1"],
+        "rollout/retool_sample_count": task_counts["retool"],
+        "rollout/search_r1_sample_count": task_counts["search-r1"],
+        "rollout/retool_reward_mean": mean(task_raw_rewards["retool"]),
+        "rollout/search_r1_reward_mean": mean(task_raw_rewards["search-r1"]),
+        "rollout/retool_train_reward_mean": mean(task_train_rewards["retool"]),
+        "rollout/search_r1_train_reward_mean": mean(task_train_rewards["search-r1"]),
+    }
+    print(
+        "[multiteacher-opd] "
+        f"retool_samples={task_counts['retool']} "
+        f"search_r1_samples={task_counts['search-r1']} "
+        f"retool_reward_mean={log_metrics['rollout/retool_reward_mean']:.4f} "
+        f"search_r1_reward_mean={log_metrics['rollout/search_r1_reward_mean']:.4f} "
+        f"retool_train_reward_mean={log_metrics['rollout/retool_train_reward_mean']:.4f} "
+        f"search_r1_train_reward_mean={log_metrics['rollout/search_r1_train_reward_mean']:.4f}",
+        flush=True,
+    )
+
     try:
         import wandb
 
         if wandb.run is not None and raw_rewards:
-            metrics = {
-                "rollout/student_task_score": sum(raw_rewards) / len(raw_rewards),
-                "rollout/retool_count": task_counts["retool"],
-                "rollout/search_r1_count": task_counts["search-r1"],
-            }
-            for task in ["retool", "search-r1"]:
-                task_rewards = [
-                    float(getattr(sample, "_opd_task_score", 0.0) or 0.0)
-                    for sample in samples
-                    if (getattr(sample, "_opd_task", None) or _get_task(sample)) == task
-                ]
-                if task_rewards:
-                    metrics[f"rollout/{task.replace('-', '_')}_task_score"] = sum(task_rewards) / len(task_rewards)
-            wandb.log(metrics)
+            wandb.log(log_metrics)
     except ImportError:
         pass
 
-    return raw_rewards, _normalize_rewards(args, raw_rewards)
+    return raw_rewards, train_rewards
