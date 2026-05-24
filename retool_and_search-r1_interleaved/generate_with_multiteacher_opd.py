@@ -50,6 +50,8 @@ _TEACHER_MAX_INFLIGHT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_INFLIGH
 _TEACHER_REQUEST_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_REQUEST_TIMEOUT", "600"))
 _TEACHER_TOTAL_BUDGET = int(os.environ.get("MULTITEACHER_OPD_TEACHER_TOTAL_BUDGET", "900"))
 _TEACHER_MAX_RETRIES = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_RETRIES", "2"))
+_LAST_TASK_REWARD_MEAN = {"retool": 0.0, "search-r1": 0.0}
+_LAST_TASK_TRAIN_REWARD_MEAN = {"retool": 0.0, "search-r1": 0.0}
 
 
 def _metadata(sample: Sample) -> dict[str, Any]:
@@ -315,16 +317,30 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     def mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
+    def mean_or_previous(task: str, values: list[float], cache: dict[str, float]) -> float:
+        if values:
+            cache[task] = mean(values)
+        return cache[task]
+
+    retool_reward_mean = mean_or_previous("retool", task_raw_rewards["retool"], _LAST_TASK_REWARD_MEAN)
+    search_r1_reward_mean = mean_or_previous("search-r1", task_raw_rewards["search-r1"], _LAST_TASK_REWARD_MEAN)
+    retool_train_reward_mean = mean_or_previous(
+        "retool", task_train_rewards["retool"], _LAST_TASK_TRAIN_REWARD_MEAN
+    )
+    search_r1_train_reward_mean = mean_or_previous(
+        "search-r1", task_train_rewards["search-r1"], _LAST_TASK_TRAIN_REWARD_MEAN
+    )
+
     log_metrics = {
         "rollout/student_task_score": mean(raw_rewards),
         "rollout/retool_count": task_counts["retool"],
         "rollout/search_r1_count": task_counts["search-r1"],
         "rollout/retool_sample_count": task_counts["retool"],
         "rollout/search_r1_sample_count": task_counts["search-r1"],
-        "rollout/retool_reward_mean": mean(task_raw_rewards["retool"]),
-        "rollout/search_r1_reward_mean": mean(task_raw_rewards["search-r1"]),
-        "rollout/retool_train_reward_mean": mean(task_train_rewards["retool"]),
-        "rollout/search_r1_train_reward_mean": mean(task_train_rewards["search-r1"]),
+        "rollout/retool_reward_mean": retool_reward_mean,
+        "rollout/search_r1_reward_mean": search_r1_reward_mean,
+        "rollout/retool_train_reward_mean": retool_train_reward_mean,
+        "rollout/search_r1_train_reward_mean": search_r1_train_reward_mean,
     }
     print(
         "[multiteacher-opd] "
