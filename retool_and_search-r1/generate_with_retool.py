@@ -654,6 +654,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # max_tool_calls=0 a true "no tools" mode (single-shot completion).
         if TOOL_CONFIGS["max_tool_calls"] <= 0:
             break
+        if TOOL_CONFIGS["max_turns"] == 1:
+            break
 
         next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
         if done:
