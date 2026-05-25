@@ -199,7 +199,13 @@ async def _teacher_logprob(args, sample: Sample, task: str) -> dict[str, Any] | 
 
 async def _task_reward(args, sample: Sample, task: str) -> float:
     if task == "retool":
-        reward = await generate_with_retool.reward_func(args, sample)
+        solution_str = generate_with_retool._prompt_to_text(sample.prompt) + sample.response
+        ground_truth = sample.label if sample.label is not None else ""
+        reward = generate_with_retool.math_dapo_compute_score(
+            solution_str,
+            ground_truth,
+            strict_box_verify=True,
+        )
     elif task == "search-r1":
         reward = await generate_with_search.reward_func(args, sample)
     else:
