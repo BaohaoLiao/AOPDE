@@ -457,28 +457,17 @@ def postprocess_predictions(prediction: str):
 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
-
-    def keep_trailing_im_end(end: int) -> str:
-        marker = "<|im_end|>"
-        cursor = end
-        while cursor < len(resp) and resp[cursor].isspace():
-            cursor += 1
-        if resp.startswith(marker, cursor):
-            return resp[: cursor + len(marker)]
-        return resp[:end]
-
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
         # Keep only the first complete <tool_call>...</tool_call> block.
         tool_call_pattern = r"<tool_call>\s*.*?\s*</tool_call>"
         match = re.search(tool_call_pattern, resp, re.DOTALL)
         if match:
-            return keep_trailing_im_end(match.end())
+            return resp[: match.end()]
 
     # Handle <code> tags
     if "</code>" in resp:
-        end = resp.find("</code>") + len("</code>")
-        return keep_trailing_im_end(end)
+        return resp.split("</code>")[0] + "</code>"
 
     # Handle ```python code blocks
     if "```python" in resp:
@@ -487,27 +476,15 @@ def postprocess_responses(resp: str) -> str:
         matches = list(re.finditer(python_pattern, resp, re.DOTALL))
         if matches:
             last_match = matches[-1]
-            return keep_trailing_im_end(last_match.end())
+            return resp[: last_match.end()]
 
     # Stop once any boxed final answer appears in the assistant response.
     if "\\boxed{" in resp:
         boxed_spans = _find_boxed_spans(resp)
         if boxed_spans:
-            return keep_trailing_im_end(boxed_spans[-1][1])
+            return resp[: boxed_spans[-1][1]]
 
     return resp
-
-
-def _ends_with_im_end(text: str) -> bool:
-    return text.rstrip().endswith("<|im_end|>")
-
-
-def _strip_leading_im_end(text: str) -> str:
-    marker = "<|im_end|>"
-    if not text.startswith(marker):
-        return text
-    text = text[len(marker):]
-    return text[1:] if text.startswith("\n") else text
 
 
 async def execute_predictions(
@@ -686,8 +663,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
             if done:
                 break
-            if _ends_with_im_end(cur_response):
-                next_obs = _strip_leading_im_end(next_obs)
 
             # Count tool calls (when we get interpreter output, it means a tool
             # was called)
