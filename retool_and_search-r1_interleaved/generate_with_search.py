@@ -5,6 +5,7 @@ import asyncio
 import json
 import os
 import re
+from typing import Any
 
 from qa_em_format import compute_score_em
 
@@ -67,21 +68,122 @@ SEARCH_R1_CONFIGS = {
 
 SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
 
+OPD_SFT_LOSS_MASK = 2
+_OPD_MIX_PROMPT_ASSISTANT = os.environ.get("SEARCH_OPD_MIX_PROMPT_ASSISTANT", "0") == "1"
+_OPD_REV_TURN_DECAY_ALPHA = float(os.environ.get("SEARCH_OPD_REV_TURN_DECAY", "0.8"))
+
+
+def _compute_normalized_turn_weight(k: int, K: int, alpha: float) -> float:
+    if K <= 1 or alpha >= 1.0:
+        return 1.0
+    if alpha <= 0.0:
+        return float(K) if k == 0 else 0.0
+    raw = [alpha ** j for j in range(K)]
+    return K * raw[k] / sum(raw)
+
 
 def _tool_system_content() -> str:
     return f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT}"
 
 
 def _system_block() -> str:
-    return f"<|im_start|>system\n{_tool_system_content()}<|im_end|>\n"
+    return f"<|im_start|>system\n{_tool_system_content()}<|im_end|>"
 
 
-def format_conversation_with_tools(prompt: str) -> str:
+def _stringify_message_content(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+                elif "content" in item:
+                    parts.append(_stringify_message_content(item.get("content")))
+                else:
+                    parts.append(json.dumps(item, ensure_ascii=False))
+            else:
+                parts.append(str(item))
+        return "\n".join(part for part in parts if part)
+    if isinstance(content, dict):
+        if "content" in content:
+            return _stringify_message_content(content.get("content"))
+        return json.dumps(content, ensure_ascii=False)
+    return str(content)
+
+
+def _parse_chat_transcript(prompt: str) -> list[dict[str, str]]:
+    pattern = re.compile(
+        r"<\|im_start\|>(system|user|assistant)\n?(.*?)(?=<\|im_end\|>)<\|im_end\|>",
+        re.DOTALL,
+    )
+    messages: list[dict[str, str]] = []
+    for role, content in pattern.findall(prompt):
+        text = content.strip()
+        if role == "assistant" and not text:
+            continue
+        if not text:
+            continue
+        if role == "system":
+            continue
+        messages.append({"role": role, "content": text})
+    return messages
+
+
+def _normalize_prompt_messages(prompt: str | list[dict[str, Any]] | None) -> list[dict[str, str]]:
+    if prompt is None:
+        return []
+    if isinstance(prompt, str) and "<|im_start|>" in prompt:
+        parsed_messages = _parse_chat_transcript(prompt)
+        if parsed_messages:
+            return parsed_messages
+    if isinstance(prompt, list):
+        normalized_messages = []
+        for message in prompt:
+            if not isinstance(message, dict):
+                content = str(message)
+                if content.strip():
+                    normalized_messages.append({"role": "user", "content": content})
+                continue
+            role = message.get("role", "user")
+            if role == "system":
+                continue
+            content = _stringify_message_content(message.get("content", ""))
+            if content.strip():
+                normalized_messages.append({"role": role, "content": content})
+        return normalized_messages
+    content = str(prompt)
+    return [{"role": "user", "content": content}] if content.strip() else []
+
+
+def _render_message_with_separator(message: dict[str, Any]) -> str:
+    role = message.get("role", "user")
+    content = message.get("content", "") or ""
+    if role == "user":
+        return f"\n<|im_start|>user\n{content}<|im_end|>"
+    if role == "assistant":
+        return f"\n<|im_start|>assistant\n{content}<|im_end|>"
+    if role == "tool":
+        return (
+            "\n<|im_start|>user\n"
+            "<tool_response>\n"
+            f"{content}\n"
+            "</tool_response><|im_end|>"
+        )
+    return ""
+
+
+def _render_messages(messages: list[dict[str, Any]]) -> str:
+    return "".join(_render_message_with_separator(message) for message in messages)
+
+
+def format_conversation_with_tools(prompt: str | list[dict[str, Any]]) -> str:
     """Add the eval-style system/tool prompt to a raw or already-rendered prompt."""
-    if TOOL_SYSTEM_PROMPT in prompt or '<tool name="search"' in prompt:
+    if isinstance(prompt, str) and (TOOL_SYSTEM_PROMPT in prompt or '<tool name="search"' in prompt):
         return prompt
 
-    if prompt.startswith("<|im_start|>system"):
+    if isinstance(prompt, str) and prompt.startswith("<|im_start|>system"):
         end_tag = "<|im_end|>"
         end = prompt.find(end_tag)
         if end != -1:
@@ -93,17 +195,20 @@ def format_conversation_with_tools(prompt: str) -> str:
                 + prompt[system_content_end:]
             )
 
-    if "<|im_start|>user" in prompt:
-        return _system_block() + prompt
+    if isinstance(prompt, str) and "<|im_start|>user" in prompt:
+        return _system_block() + "\n" + prompt
 
-    return (
-        _system_block()
-        + f"<|im_start|>user\n{prompt}<|im_end|>\n"
-        + "<|im_start|>assistant\n"
-    )
+    messages = _normalize_prompt_messages(prompt)
+    return _system_block() + _render_messages(messages) + "\n<|im_start|>assistant\n"
 
 
-def _extract_user_messages(prompt: str) -> list[str]:
+def _extract_user_messages(prompt: str | list[dict[str, Any]]) -> list[str]:
+    if not isinstance(prompt, str):
+        return [
+            message["content"]
+            for message in _normalize_prompt_messages(prompt)
+            if message.get("role") == "user"
+        ]
     matches = re.findall(r"<\|im_start\|>user\s*(.*?)<\|im_end\|>", prompt, re.DOTALL)
     if matches:
         return [match.strip() for match in matches if match.strip()]
@@ -159,11 +264,59 @@ def _apply_final_token_clip(
     )
 
 
-def _initial_trace_messages(raw_prompt: str) -> list[dict[str, str]]:
+def _initial_trace_messages(raw_prompt: str | list[dict[str, Any]]) -> list[dict[str, str]]:
     messages = [{"role": "system", "content": _tool_system_content()}]
     for content in _extract_user_messages(raw_prompt):
         messages.append({"role": "user", "content": content})
     return messages
+
+
+def _build_mixed_loss_seed(
+    tokenizer,
+    sample_prompt: Any,
+) -> tuple[list[int], list[int], list[int], bool, list[dict[str, Any]]] | None:
+    """Seed in-prompt assistant tokens as SFT positions for OPD mixed loss."""
+    normalized_messages = _normalize_prompt_messages(sample_prompt)
+    if not normalized_messages:
+        return None
+
+    prompt_text = _system_block()
+    prompt_ids = list(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
+    seed_token_ids: list[int] = []
+    seed_loss_masks: list[int] = []
+
+    for message in normalized_messages:
+        segment = _render_message_with_separator(message)
+        if not segment:
+            continue
+        segment_ids = list(tokenizer(segment, add_special_tokens=False)["input_ids"])
+        mask_value = OPD_SFT_LOSS_MASK if message.get("role") == "assistant" else 0
+        seed_token_ids += segment_ids
+        seed_loss_masks += [mask_value] * len(segment_ids)
+
+    ends_with_assistant = normalized_messages[-1].get("role") == "assistant"
+    if not ends_with_assistant:
+        trailing = "\n<|im_start|>assistant\n"
+        trailing_ids = list(tokenizer(trailing, add_special_tokens=False)["input_ids"])
+        seed_token_ids += trailing_ids
+        seed_loss_masks += [0] * len(trailing_ids)
+
+    expected_text = (
+        prompt_text + _render_messages(normalized_messages)
+        if ends_with_assistant
+        else format_conversation_with_tools(sample_prompt)
+    )
+    expected_ids = list(tokenizer(expected_text, add_special_tokens=False)["input_ids"])
+    if expected_ids != prompt_ids + seed_token_ids:
+        print(
+            f"[search-opd-mix] WARN: tokenization parity failed "
+            f"(expected={len(expected_ids)}, got={len(prompt_ids) + len(seed_token_ids)}); "
+            f"falling back to standard rollout.",
+            flush=True,
+        )
+        return None
+
+    return prompt_ids, seed_token_ids, seed_loss_masks, ends_with_assistant, normalized_messages
 
 
 def _passages2string(retrieval_result):
@@ -223,19 +376,42 @@ def extract_boxed_answer(prediction: str) -> str | None:
     return None
 
 
-# IMPORTANT: When we need to collect log probabilities (logp), we CANNOT change
-# strings returned from SGLang because token/logp arrays would no longer align.
-# Therefore, postprocess_responses is only used when return_logprob=False.
 def postprocess_responses(resp: str) -> str:
-    """
-    Post-process response to ensure tag completeness.
-    Only used when SEARCH_R1_CONFIGS["return_logprob"] is False.
-    """
-    if "</tool_call>" in resp:
-        return resp.split("</tool_call>")[0] + "</tool_call>"
-    if "</answer>" in resp:
-        return resp.split("</answer>")[0] + "</answer>"
+    """Keep only the first complete action/final-answer block."""
+    tool_call_pattern = r"<tool_call>\s*.*?\s*</tool_call>"
+    tool_call_match = re.search(tool_call_pattern, resp, re.DOTALL)
+    if tool_call_match:
+        return resp[: tool_call_match.end()]
+    answer_match = re.search(r"<answer>.*?</answer>", resp, re.DOTALL)
+    if answer_match:
+        return resp[: answer_match.end()]
+    boxed = extract_boxed_answer(resp)
+    if boxed is not None:
+        boxed_match = re.search(r"\\boxed\{[^}]*\}", resp)
+        if boxed_match:
+            return resp[: boxed_match.end()]
     return resp
+
+
+def _trim_response_token_prefix(
+    tokenizer,
+    raw_token_ids: list[int],
+    raw_log_probs: list[float],
+    sanitized_response: str,
+) -> tuple[list[int], list[float]]:
+    raw_response = tokenizer.decode(raw_token_ids)
+    if sanitized_response == raw_response:
+        return raw_token_ids, raw_log_probs
+    if not sanitized_response:
+        return [], []
+    for prefix_len in range(1, len(raw_token_ids) + 1):
+        if tokenizer.decode(raw_token_ids[:prefix_len]) == sanitized_response:
+            return raw_token_ids[:prefix_len], raw_log_probs[:prefix_len]
+    sanitized_token_ids = tokenizer(sanitized_response, add_special_tokens=False)["input_ids"]
+    trimmed_log_probs = raw_log_probs[: len(sanitized_token_ids)]
+    if len(trimmed_log_probs) < len(sanitized_token_ids):
+        trimmed_log_probs += [0.0] * (len(sanitized_token_ids) - len(trimmed_log_probs))
+    return sanitized_token_ids, trimmed_log_probs
 
 
 def _extract_first_tool_call(prediction: str) -> dict | None:
@@ -258,6 +434,11 @@ def postprocess_predictions(prediction: str) -> tuple[str | None, str]:
     tool_call = _extract_first_tool_call(prediction)
     if tool_call and tool_call.get("name") == "search":
         arguments = tool_call.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
         if isinstance(arguments, dict):
             return "search", str(arguments.get("query", ""))
         return "search", ""
@@ -310,16 +491,41 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
 
     state = GenerateState(args)
-
     url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
 
-    # Set up the initial prompt with the same system/tool instructions used by eval.
     prompt_text = format_conversation_with_tools(sample.prompt)
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    max_context_length = args.rollout_max_response_len - 16
-    max_tokens_per_gpu = getattr(args, "max_tokens_per_gpu", None)
-    if max_tokens_per_gpu is not None:
-        max_context_length = min(max_context_length, args.context_parallel_size * max_tokens_per_gpu - 16)
+    sft_seed_token_ids: list[int] = []
+    sft_seed_loss_masks: list[int] = []
+    sft_skip_rollout = False
+    used_mixed_loss_seed = False
+    sft_normalized_messages: list[dict[str, Any]] | None = None
+
+    if _OPD_MIX_PROMPT_ASSISTANT:
+        seed_result = _build_mixed_loss_seed(state.tokenizer, sample.prompt)
+        if seed_result is not None:
+            (
+                prompt_tokens_ids,
+                sft_seed_token_ids,
+                sft_seed_loss_masks,
+                sft_skip_rollout,
+                sft_normalized_messages,
+            ) = seed_result
+            prompt_text = _system_block()
+            used_mixed_loss_seed = True
+            print(
+                f"[search-opd-mix] sample_start prompt_ids={len(prompt_tokens_ids)} "
+                f"seed_ids={len(sft_seed_token_ids)} "
+                f"sft_tokens={sum(1 for m in sft_seed_loss_masks if m == OPD_SFT_LOSS_MASK)} "
+                f"ends_with_assistant={sft_skip_rollout}",
+                flush=True,
+            )
+
+    if getattr(args, "rollout_max_context_len", None) is not None:
+        max_context_length = args.rollout_max_context_len
+    else:
+        max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
+    max_context_length = max_context_length - 16
     if len(prompt_tokens_ids) >= max_context_length:
         sample.tokens = prompt_tokens_ids[:max_context_length]
         sample.response_length = 0
@@ -327,6 +533,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.loss_mask = []
         sample.prompt = state.tokenizer.decode(sample.tokens, skip_special_tokens=False)
         sample.status = Sample.Status.TRUNCATED
+        sample.rollout_log_probs = []
         return sample
 
     response = ""
@@ -334,19 +541,46 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
     messages = _initial_trace_messages(sample.prompt)
+    if used_mixed_loss_seed and sft_normalized_messages:
+        messages.extend(sft_normalized_messages)
     search_count = 0
     observation_truncated = False
     final_was_clipped = False
     last_finish_reason = None
 
-    for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
+    if used_mixed_loss_seed and sft_seed_token_ids:
+        response += state.tokenizer.decode(sft_seed_token_ids, skip_special_tokens=False)
+        response_token_ids += list(sft_seed_token_ids)
+        loss_mask += list(sft_seed_loss_masks)
+        if rollout_log_probs is not None:
+            rollout_log_probs += [0.0] * len(sft_seed_token_ids)
+
+    def _merged_stop_strings(existing_stop) -> list[str]:
+        stop_strings: list[str] = []
+        if isinstance(existing_stop, str):
+            stop_strings.append(existing_stop)
+        elif isinstance(existing_stop, list):
+            stop_strings.extend(str(item) for item in existing_stop)
+        for stop in ("</tool_call>", "</answer>"):
+            if stop not in stop_strings:
+                stop_strings.append(stop)
+        return stop_strings
+
+    if sft_skip_rollout:
+        print(
+            f"[search-opd-mix] sample ends with assistant; skipping rollout "
+            f"(SFT-only sample, response_tokens={len(response_token_ids)})",
+            flush=True,
+        )
+
+    for _turn_idx in range(0 if sft_skip_rollout else SEARCH_R1_CONFIGS["max_turns"]):
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
             break
         remaining_context = max_context_length - total_length
         turn_sampling_params = dict(sampling_params)
-        turn_sampling_params["stop"] = ["</answer>"]
+        turn_sampling_params["stop"] = _merged_stop_strings(turn_sampling_params.get("stop"))
         turn_sampling_params["max_new_tokens"] = min(
             turn_sampling_params.get("max_new_tokens", remaining_context),
             remaining_context,
@@ -365,31 +599,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         output = await post(url, payload)
         last_finish_reason = output["meta_info"]["finish_reason"]["type"]
 
-        # abort
         if last_finish_reason == "abort":
             sample.status = Sample.Status.ABORTED
-            return sample
+            break
 
-        cur_response = output["text"]
-
-        # Extract tokens and log probs based on configuration
         if SEARCH_R1_CONFIGS["return_logprob"]:
-            # Extract log probs from output - required for TIS metrics
             if "output_token_logprobs" not in output["meta_info"]:
                 raise RuntimeError(
                     "output_token_logprobs not found in output meta_info. "
                     "Make sure 'return_logprob': True is set in the payload."
                 )
-
-            # Use token IDs and log probs directly from output_token_logprobs
-            # This ensures perfect alignment between tokens and log probs
-            # output_token_logprobs format: [[log_prob, token_id, ...], ...]
-            cur_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            cur_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            raw_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+            cur_response = postprocess_responses(state.tokenizer.decode(raw_token_ids))
+            cur_response_token_ids, cur_response_log_probs = _trim_response_token_prefix(
+                state.tokenizer,
+                raw_token_ids,
+                raw_log_probs,
+                cur_response,
+            )
         else:
-            # When not collecting log probs, we can safely postprocess the response
-            cur_response = postprocess_responses(cur_response)
-            # Tokenize the (possibly postprocessed) response
+            cur_response = postprocess_responses(output["text"])
             cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
 
         response += cur_response
@@ -401,9 +631,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         if SEARCH_R1_CONFIGS["return_logprob"]:
             rollout_log_probs += cur_response_log_probs
 
-        if last_finish_reason == "length":
+        action, _ = postprocess_predictions(cur_response)
+        if last_finish_reason == "length" and action not in {"search", "answer", "boxed_answer"}:
             sample.status = Sample.Status.TRUNCATED
             break
+
         if SEARCH_R1_CONFIGS["max_turns"] == 1:
             break
 
@@ -442,6 +674,9 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 rollout_log_probs
             ), f"Token/logp length mismatch: {len(response_token_ids)} tokens vs {len(rollout_log_probs)} logps"
         if obs_was_truncated:
+            break
+
+        if sample.status == Sample.Status.TRUNCATED:
             break
 
     # Store statistics for wandb logging
@@ -486,18 +721,60 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Store log probs if enabled
     if SEARCH_R1_CONFIGS["return_logprob"]:
-        sample.rollout_log_probs = final_rollout_log_probs if final_rollout_log_probs else None
+        sample.rollout_log_probs = final_rollout_log_probs if final_rollout_log_probs is not None else []
+        if len(sample.rollout_log_probs) != sample.response_length:
+            if len(sample.rollout_log_probs) < sample.response_length:
+                sample.rollout_log_probs += [0.0] * (sample.response_length - len(sample.rollout_log_probs))
+            else:
+                sample.rollout_log_probs = sample.rollout_log_probs[: sample.response_length]
+
+    if sample.response_length == 0:
+        pad_token_id = (
+            state.tokenizer.pad_token_id
+            if state.tokenizer.pad_token_id is not None
+            else (state.tokenizer.eos_token_id or 0)
+        )
+        sample.tokens = list(sample.tokens) + [pad_token_id]
+        sample.response = state.tokenizer.decode([pad_token_id], skip_special_tokens=False)
+        sample.response_length = 1
+        sample.loss_mask = [0]
+        sample.rollout_log_probs = [0.0]
+        if sample.status not in {Sample.Status.ABORTED, Sample.Status.TRUNCATED}:
+            sample.status = Sample.Status.TRUNCATED
 
     if final_was_clipped:
         sample.status = Sample.Status.TRUNCATED
 
-    if sample.status == Sample.Status.PENDING:
+    _k_raw = sample.metadata.get("assistant_turn_index")
+    _K_raw = sample.metadata.get("total_assistant_turns")
+    if _k_raw is not None and _K_raw is not None:
+        try:
+            _k = int(_k_raw)
+            _K = int(_K_raw)
+            if _K >= 1 and 0 <= _k < _K:
+                sample.metadata["opd_rev_kl_weight"] = _compute_normalized_turn_weight(
+                    _k,
+                    _K,
+                    _OPD_REV_TURN_DECAY_ALPHA,
+                )
+            else:
+                sample.metadata["opd_rev_kl_weight"] = 1.0
+        except (TypeError, ValueError):
+            sample.metadata["opd_rev_kl_weight"] = 1.0
+    else:
+        sample.metadata["opd_rev_kl_weight"] = 1.0
+
+    if sample.status == Sample.Status.PENDING and sft_skip_rollout:
+        sample.status = Sample.Status.COMPLETED
+    elif sample.status == Sample.Status.PENDING:
         match last_finish_reason:
             case "length":
                 sample.status = Sample.Status.TRUNCATED
             case "abort":
                 sample.status = Sample.Status.ABORTED
             case "stop":
+                sample.status = Sample.Status.COMPLETED
+            case _:
                 sample.status = Sample.Status.COMPLETED
 
     return sample
