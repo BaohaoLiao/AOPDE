@@ -68,19 +68,6 @@ SEARCH_R1_CONFIGS = {
 
 SEMAPHORE = asyncio.Semaphore(SEARCH_R1_CONFIGS["search_concurrency"])
 
-OPD_SFT_LOSS_MASK = 2
-_OPD_MIX_PROMPT_ASSISTANT = os.environ.get("SEARCH_OPD_MIX_PROMPT_ASSISTANT", "0") == "1"
-_OPD_REV_TURN_DECAY_ALPHA = float(os.environ.get("SEARCH_OPD_REV_TURN_DECAY", "0.8"))
-
-
-def _compute_normalized_turn_weight(k: int, K: int, alpha: float) -> float:
-    if K <= 1 or alpha >= 1.0:
-        return 1.0
-    if alpha <= 0.0:
-        return float(K) if k == 0 else 0.0
-    raw = [alpha ** j for j in range(K)]
-    return K * raw[k] / sum(raw)
-
 
 def _tool_system_content() -> str:
     return f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT}"
@@ -271,54 +258,6 @@ def _initial_trace_messages(raw_prompt: str | list[dict[str, Any]]) -> list[dict
     return messages
 
 
-def _build_mixed_loss_seed(
-    tokenizer,
-    sample_prompt: Any,
-) -> tuple[list[int], list[int], list[int], bool, list[dict[str, Any]]] | None:
-    """Seed in-prompt assistant tokens as SFT positions for OPD mixed loss."""
-    normalized_messages = _normalize_prompt_messages(sample_prompt)
-    if not normalized_messages:
-        return None
-
-    prompt_text = _system_block()
-    prompt_ids = list(tokenizer(prompt_text, add_special_tokens=False)["input_ids"])
-    seed_token_ids: list[int] = []
-    seed_loss_masks: list[int] = []
-
-    for message in normalized_messages:
-        segment = _render_message_with_separator(message)
-        if not segment:
-            continue
-        segment_ids = list(tokenizer(segment, add_special_tokens=False)["input_ids"])
-        mask_value = OPD_SFT_LOSS_MASK if message.get("role") == "assistant" else 0
-        seed_token_ids += segment_ids
-        seed_loss_masks += [mask_value] * len(segment_ids)
-
-    ends_with_assistant = normalized_messages[-1].get("role") == "assistant"
-    if not ends_with_assistant:
-        trailing = "\n<|im_start|>assistant\n"
-        trailing_ids = list(tokenizer(trailing, add_special_tokens=False)["input_ids"])
-        seed_token_ids += trailing_ids
-        seed_loss_masks += [0] * len(trailing_ids)
-
-    expected_text = (
-        prompt_text + _render_messages(normalized_messages)
-        if ends_with_assistant
-        else format_conversation_with_tools(sample_prompt)
-    )
-    expected_ids = list(tokenizer(expected_text, add_special_tokens=False)["input_ids"])
-    if expected_ids != prompt_ids + seed_token_ids:
-        print(
-            f"[search-opd-mix] WARN: tokenization parity failed "
-            f"(expected={len(expected_ids)}, got={len(prompt_ids) + len(seed_token_ids)}); "
-            f"falling back to standard rollout.",
-            flush=True,
-        )
-        return None
-
-    return prompt_ids, seed_token_ids, seed_loss_masks, ends_with_assistant, normalized_messages
-
-
 def _passages2string(retrieval_result):
     """
     Convert retrieval results to a formatted string.
@@ -495,31 +434,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     prompt_text = format_conversation_with_tools(sample.prompt)
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
-    sft_seed_token_ids: list[int] = []
-    sft_seed_loss_masks: list[int] = []
-    sft_skip_rollout = False
-    used_mixed_loss_seed = False
-    sft_normalized_messages: list[dict[str, Any]] | None = None
-
-    if _OPD_MIX_PROMPT_ASSISTANT:
-        seed_result = _build_mixed_loss_seed(state.tokenizer, sample.prompt)
-        if seed_result is not None:
-            (
-                prompt_tokens_ids,
-                sft_seed_token_ids,
-                sft_seed_loss_masks,
-                sft_skip_rollout,
-                sft_normalized_messages,
-            ) = seed_result
-            prompt_text = _system_block()
-            used_mixed_loss_seed = True
-            print(
-                f"[search-opd-mix] sample_start prompt_ids={len(prompt_tokens_ids)} "
-                f"seed_ids={len(sft_seed_token_ids)} "
-                f"sft_tokens={sum(1 for m in sft_seed_loss_masks if m == OPD_SFT_LOSS_MASK)} "
-                f"ends_with_assistant={sft_skip_rollout}",
-                flush=True,
-            )
 
     if getattr(args, "rollout_max_context_len", None) is not None:
         max_context_length = args.rollout_max_context_len
@@ -541,19 +455,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     loss_mask = []
     rollout_log_probs = [] if SEARCH_R1_CONFIGS["return_logprob"] else None
     messages = _initial_trace_messages(sample.prompt)
-    if used_mixed_loss_seed and sft_normalized_messages:
-        messages.extend(sft_normalized_messages)
     search_count = 0
     observation_truncated = False
     final_was_clipped = False
     last_finish_reason = None
-
-    if used_mixed_loss_seed and sft_seed_token_ids:
-        response += state.tokenizer.decode(sft_seed_token_ids, skip_special_tokens=False)
-        response_token_ids += list(sft_seed_token_ids)
-        loss_mask += list(sft_seed_loss_masks)
-        if rollout_log_probs is not None:
-            rollout_log_probs += [0.0] * len(sft_seed_token_ids)
 
     def _merged_stop_strings(existing_stop) -> list[str]:
         stop_strings: list[str] = []
@@ -566,14 +471,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 stop_strings.append(stop)
         return stop_strings
 
-    if sft_skip_rollout:
-        print(
-            f"[search-opd-mix] sample ends with assistant; skipping rollout "
-            f"(SFT-only sample, response_tokens={len(response_token_ids)})",
-            flush=True,
-        )
-
-    for _turn_idx in range(0 if sft_skip_rollout else SEARCH_R1_CONFIGS["max_turns"]):
+    for _turn_idx in range(SEARCH_R1_CONFIGS["max_turns"]):
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
@@ -745,28 +643,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     if final_was_clipped:
         sample.status = Sample.Status.TRUNCATED
 
-    _k_raw = sample.metadata.get("assistant_turn_index")
-    _K_raw = sample.metadata.get("total_assistant_turns")
-    if _k_raw is not None and _K_raw is not None:
-        try:
-            _k = int(_k_raw)
-            _K = int(_K_raw)
-            if _K >= 1 and 0 <= _k < _K:
-                sample.metadata["opd_rev_kl_weight"] = _compute_normalized_turn_weight(
-                    _k,
-                    _K,
-                    _OPD_REV_TURN_DECAY_ALPHA,
-                )
-            else:
-                sample.metadata["opd_rev_kl_weight"] = 1.0
-        except (TypeError, ValueError):
-            sample.metadata["opd_rev_kl_weight"] = 1.0
-    else:
-        sample.metadata["opd_rev_kl_weight"] = 1.0
+    if sample.metadata is None:
+        sample.metadata = {}
+    sample.metadata["opd_rev_kl_weight"] = 1.0
 
-    if sample.status == Sample.Status.PENDING and sft_skip_rollout:
-        sample.status = Sample.Status.COMPLETED
-    elif sample.status == Sample.Status.PENDING:
+    if sample.status == Sample.Status.PENDING:
         match last_finish_reason:
             case "length":
                 sample.status = Sample.Status.TRUNCATED
