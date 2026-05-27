@@ -1,5 +1,12 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import asyncio
+# IMPORTANT: install the stdlib asyncio loop policy BEFORE slime's
+# AsyncLoopThread creates its event loop. uvloop + concurrent subprocess.Popen
+# in tool_sandbox + many aiohttp sockets reliably triggers a SIGABRT in the
+# event-loop thread under load. The stdlib selector loop is slower but stable.
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 import json
+import os
 import re
 from typing import Any
 
@@ -15,6 +22,80 @@ except ImportError as e:
 
 # Import tool sandbox functionality
 from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
+
+# Wall-clock cap for the full multi-turn rollout of a single sample. When
+# exceeded, the partial response is kept (so far decoded tokens) and the
+# sample is marked TRUNCATED so the rest of the batch can proceed. Override
+# via the GENERATE_SAMPLE_TIMEOUT env var (seconds).
+_SAMPLE_TIMEOUT = float(os.environ.get("GENERATE_SAMPLE_TIMEOUT", "600"))
+
+# ---------------------------------------------------------------------------
+# OPD mixed-loss support
+#
+# When RETOOL_OPD_MIX_PROMPT_ASSISTANT=1, any assistant turn(s) at the end of
+# sample.prompt are popped off the prompt and treated as the rollout response
+# with loss_mask=OPD_SFT_LOSS_MASK (=2). Slime's OPD kernel then applies a
+# forward-KL (≡ SFT) gradient at those positions instead of reverse-KL.
+#
+# Mask convention (consumed by slime's apply_opd_kl_to_advantages):
+#     0  →  ignored (tool observations, padding)
+#     1  →  reverse KL (student-rollout assistant tokens)
+#     2  →  forward KL / SFT (in-prompt assistant demonstration tokens)
+#
+# Stage 1 limitation: only TRAILING assistant turns are supported. Mid-prompt
+# assistant turns (assistant followed by user/tool) sit inside the prompt span
+# that slime's loss kernel discards; supporting them requires plumbing a
+# full-sequence mask through actor.forward, log_prob slicing, advantage
+# computation, and the policy-loss reduction — see Stage 2 design notes in
+# the change description.
+# ---------------------------------------------------------------------------
+OPD_SFT_LOSS_MASK = 2
+_OPD_MIX_PROMPT_ASSISTANT = os.environ.get("RETOOL_OPD_MIX_PROMPT_ASSISTANT", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# OPD per-turn reverse-KL weighting (mean-1 normalization)
+#
+# Each teacher trace of K assistant turns is fanned out at data-prep time
+# into K sub-prompts (turn k = student generates turn k given turns 1..k-1
+# as prefix, k is 0-indexed). Earlier turns explore more (less-conditioned),
+# later turns are more constrained — we want stronger reverse-KL signal on
+# earlier turns.
+#
+# The dataset must provide two metadata fields per sample:
+#     "assistant_turn_index"   : k, 0-indexed (0 = first assistant turn)
+#     "total_assistant_turns"  : K (>= 1)
+#
+# Weight schedule:  raw r_k = alpha^k    (k = 0..K-1, alpha in (0,1])
+# Normalization:    w_k = K * r_k / sum_j r_j
+# Properties:
+#   * mean(w_k over k=0..K-1) = 1  -> opd_kl_coef keeps its semantics
+#   * w_0 > w_1 > ... > w_{K-1} > 0  (early turns boosted, late dampened)
+#   * alpha = 1.0 disables the schedule (all weights = 1)
+# Override alpha via env var RETOOL_OPD_REV_TURN_DECAY (default 0.8).
+# ---------------------------------------------------------------------------
+_OPD_REV_TURN_DECAY_ALPHA = float(os.environ.get("RETOOL_OPD_REV_TURN_DECAY", "0.8"))
+
+
+def _compute_normalized_turn_weight(k: int, K: int, alpha: float) -> float:
+    """Mean-1 normalized exponential decay weight for sample at turn k of K total.
+
+    Args:
+        k: 0-indexed turn that the student is generating (0 = first turn).
+        K: total number of assistant turns in the original teacher trace.
+        alpha: decay base in (0, 1]. 1.0 disables decay.
+
+    Returns:
+        Per-sample reverse-KL multiplier w_k. Mean over k=0..K-1 equals 1.0.
+    """
+    if K <= 1 or alpha >= 1.0:
+        return 1.0
+    if alpha <= 0.0:
+        # Degenerate: only turn 0 is trained.
+        return float(K) if k == 0 else 0.0
+    # raw_k = alpha^k for k in [0, K-1]
+    raw = [alpha ** j for j in range(K)]
+    total = sum(raw)
+    return K * raw[k] / total
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
@@ -362,9 +443,8 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
 def _find_boxed_spans(text: str) -> list[tuple[int, int, str]]:
     """Find all top-level ``\\boxed{...}`` spans with balanced braces.
 
-    Returns a list of ``(start, end, inner_content)`` tuples. Handles arbitrary
-    brace nesting (e.g. ``\\frac{a^{b}}{c}`` inside the box) which a fixed-depth
-    regex cannot match.
+    Handles arbitrary brace nesting (e.g. ``\\frac{a^{b}}{c}``) which a
+    fixed-depth regex cannot match.
     """
     spans: list[tuple[int, int, str]] = []
     needle = "\\boxed{"
@@ -411,9 +491,19 @@ def postprocess_predictions(prediction: str):
         tool_name = tool_call_data.get("name")
         arguments = tool_call_data.get("arguments", {})
 
+        # Some models emit arguments as a JSON-encoded string (OpenAI-style)
+        # rather than a dict. Decode defensively before .get().
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
         if tool_name == "code_interpreter":
             code = arguments.get("code", "")
-            if code.strip():
+            if isinstance(code, str) and code.strip():
                 return "code", code
 
     # Then check for <code> tags
@@ -527,10 +617,124 @@ async def execute_predictions(
     return next_obs, done, tool_message
 
 
+# ---------------------------------------------------------------------------
+# Mixed forward/reverse-KL helpers
+#
+# Strategy: when RETOOL_OPD_MIX_PROMPT_ASSISTANT=1, redefine the prompt /
+# response cut so that EVERY assistant token from sample.prompt is part of
+# the trainable response span (with loss_mask=OPD_SFT_LOSS_MASK=2 -> forward
+# KL / SFT). The prompt becomes just the system+tools header. The on-policy
+# rollout still runs from the trailing "<|im_start|>assistant" position and
+# its generated tokens get loss_mask=1 (reverse-KL) as usual.
+#
+# Slime's loss kernel only computes loss over the trailing response_length
+# tokens of each sample, so by enlarging response_length to cover all
+# sample.prompt messages we get the SFT signal on every in-prompt assistant
+# token (not just trailing ones) WITHOUT having to plumb full-sequence masks
+# through actor.forward, log_prob slicing, advantage computation, and the
+# policy loss reduction.
+# ---------------------------------------------------------------------------
+
+def _render_message_with_separator(msg: dict[str, Any]) -> str:
+    """Render a single chat message as the text fragment that follows the
+    "\\n" separator inside ``format_conversation_with_tools``. Returned text
+    INCLUDES the leading ``\\n``."""
+    role = msg.get("role", "user")
+    content = msg.get("content", "") or ""
+    if role == "system":
+        return f"\n<|im_start|>system\n{content}<|im_end|>"
+    if role == "user":
+        return f"\n<|im_start|>user\n{content}<|im_end|>"
+    if role == "assistant":
+        parts = ["<|im_start|>assistant", content]
+        for tool_call in msg.get("tool_calls", []) or []:
+            parts.append("<tool_call>")
+            parts.append(json.dumps(tool_call["function"], ensure_ascii=False))
+            parts.append("</tool_call>")
+        parts.append("<|im_end|>")
+        body = "\n".join(p for p in parts if p != "")
+        return "\n" + body
+    if role == "tool":
+        return (
+            "\n<|im_start|>user\n"
+            "<tool_response>\n"
+            f"{content}\n"
+            "</tool_response><|im_end|>"
+        )
+    return ""
+
+
+def _build_mixed_loss_seed(
+    tokenizer,
+    sample_prompt: Any,
+    tool_specs: list[dict[str, Any]],
+    full_system_prompt: str,
+) -> tuple[list[int], list[int], list[int], bool, list[dict[str, Any]]] | None:
+    """Compute (prompt_ids, seed_response_ids, seed_loss_masks,
+    ends_with_assistant, normalized_messages) for the mixed-loss seeding path.
+
+    Returns None if the incremental tokenization does not exactly reproduce
+    the whole-prompt tokenization (BPE merges across boundaries, custom
+    chat-template quirks, etc). Caller falls back to the standard path.
+    """
+    normalized_messages = _normalize_prompt_messages(sample_prompt)
+    if not normalized_messages:
+        return None
+
+    # System+tools header (no trailing assistant header, no messages).
+    system_text = f"<|im_start|>system\n{full_system_prompt}<|im_end|>"
+    prompt_ids: list[int] = list(tokenizer(system_text, add_special_tokens=False)["input_ids"])
+
+    seed_token_ids: list[int] = []
+    seed_loss_masks: list[int] = []
+    for msg in normalized_messages:
+        seg_text = _render_message_with_separator(msg)
+        if not seg_text:
+            continue
+        seg_ids = list(tokenizer(seg_text, add_special_tokens=False)["input_ids"])
+        if not seg_ids:
+            continue
+        mask_val = OPD_SFT_LOSS_MASK if msg.get("role") == "assistant" else 0
+        seed_token_ids += seg_ids
+        seed_loss_masks += [mask_val] * len(seg_ids)
+
+    ends_with_assistant = normalized_messages[-1].get("role") == "assistant"
+
+    # Append the trailing "<|im_start|>assistant" generation header UNLESS the
+    # last message was already assistant (in which case we have no rollout and
+    # closing the conversation cleanly is correct).
+    if not ends_with_assistant:
+        trailing_text = "\n<|im_start|>assistant"
+        trailing_ids = list(tokenizer(trailing_text, add_special_tokens=False)["input_ids"])
+        seed_token_ids += trailing_ids
+        seed_loss_masks += [0] * len(trailing_ids)
+
+    # Parity check: incremental tokenization must equal whole-string
+    # tokenization, otherwise loss_mask alignment is off and we silently
+    # corrupt training. Fall back to the standard path on mismatch.
+    if ends_with_assistant:
+        # _render_recorded_messages renders messages without appending a
+        # trailing assistant header — exact match for our seeded tokens.
+        full_text = system_text + "\n" + _render_recorded_messages(normalized_messages)
+    else:
+        full_text = format_conversation_with_tools(prompt=sample_prompt, tools=tool_specs)
+    expected_ids = list(tokenizer(full_text, add_special_tokens=False)["input_ids"])
+    actual_ids = prompt_ids + seed_token_ids
+    if expected_ids != actual_ids:
+        print(
+            f"[opd-mix] WARN: incremental tokenization parity check FAILED "
+            f"(expected {len(expected_ids)} tokens, got {len(actual_ids)}); "
+            f"falling back to standard rollout (no SFT seeding) for this sample.",
+            flush=True,
+        )
+        return None
+
+    return prompt_ids, seed_token_ids, seed_loss_masks, ends_with_assistant, normalized_messages
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
-
     state = GenerateState(args)
     tool_registry = ToolRegistry()
     sandbox_session_id = tool_registry.session_id
@@ -539,14 +743,55 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
-    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    # Build recorded_messages with the full system prompt (including tool descriptions)
-    # so that payload_text faithfully reflects what the model actually sees.
+
+    # Build the full system prompt text once; we need it both for tokenizing
+    # the system+tools prefix in the mixed-loss path, and for recorded_messages.
     full_system_prompt = DEFAULT_SYSTEM_PROMPT
     if tool_specs:
         tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tool_specs)
         full_system_prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+
+    # Mixed forward/reverse-KL: when enabled, EVERY assistant token in
+    # sample.prompt becomes a forward-KL (SFT) target. We achieve this by
+    # cutting prompt = system+tools only, and seeding the response with all
+    # sample.prompt messages (assistant tokens -> mask 2, user/tool tokens ->
+    # mask 0) plus the trailing assistant generation header.
+    sft_seed_token_ids: list[int] = []
+    sft_seed_loss_masks: list[int] = []
+    sft_skip_rollout = False  # set True if sample.prompt ends with assistant
+    sft_normalized_messages: list[dict[str, Any]] | None = None
+    used_mixed_loss_seed = False
+    if _OPD_MIX_PROMPT_ASSISTANT:
+        seed_result = _build_mixed_loss_seed(
+            tokenizer=state.tokenizer,
+            sample_prompt=sample.prompt,
+            tool_specs=tool_specs,
+            full_system_prompt=full_system_prompt,
+        )
+        if seed_result is not None:
+            (
+                _prompt_ids_only,
+                sft_seed_token_ids,
+                sft_seed_loss_masks,
+                ends_with_assistant,
+                sft_normalized_messages,
+            ) = seed_result
+            prompt_tokens_ids = _prompt_ids_only
+            sft_skip_rollout = ends_with_assistant
+            used_mixed_loss_seed = True
+            n_sft = sum(1 for m in sft_seed_loss_masks if m == OPD_SFT_LOSS_MASK)
+            print(
+                f"[opd-mix] sample_start prompt_ids={len(prompt_tokens_ids)} "
+                f"seed_ids={len(sft_seed_token_ids)} sft_tokens={n_sft} "
+                f"ends_with_assistant={ends_with_assistant}",
+                flush=True,
+            )
+
+    if not used_mixed_loss_seed:
+        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+        prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    # Build recorded_messages with the full system prompt (including tool descriptions)
+    # so that payload_text faithfully reflects what the model actually sees.
     recorded_messages = _build_initial_recorded_messages(sample.prompt, system_prompt=full_system_prompt)
     interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
@@ -573,136 +818,187 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     last_finish_reason = None
 
-    for turn in range(TOOL_CONFIGS["max_turns"]):
-        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
-        current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    # Seed the response with the in-prompt SFT (forward-KL) tokens, if the
+    # mixed-loss path is active. rollout_log_probs gets zeros at SFT positions;
+    # the actor's own forward pass produces the "old" log-probs for those
+    # positions during training, so DO NOT enable --use-rollout-logprobs when
+    # using mixed loss.
+    if used_mixed_loss_seed and sft_seed_token_ids:
+        sft_extension_decoded = state.tokenizer.decode(sft_seed_token_ids, skip_special_tokens=False)
+        response += sft_extension_decoded
+        response_token_ids += list(sft_seed_token_ids)
+        loss_masks += list(sft_seed_loss_masks)
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = []
+        sample.rollout_log_probs += [0.0] * len(sft_seed_token_ids)
+        # The rollout loop renders sample.prompt + interaction_messages every
+        # turn; sample.prompt already contains all the in-prompt messages, so
+        # interaction_messages stays empty here. But populate recorded_messages
+        # so debug logging reflects the seeded chat history (these messages
+        # are already part of sample.prompt — _build_initial_recorded_messages
+        # only added system, so we extend with sample.prompt's messages).
+        for msg in sft_normalized_messages or []:
+            recorded_messages.append(msg)
+        sample.messages = list(recorded_messages)
 
-        # Check if total length exceeds max context length
-        total_length = len(current_prompt_token_ids)
-        if total_length >= max_context_length:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        remaining_context = max_context_length - total_length
-
-        # Use token IDs instead of text
-        current_token_ids = current_prompt_token_ids
-        current_sampling_params = dict(sampling_params)
-        current_sampling_params["max_new_tokens"] = min(
-            current_sampling_params["max_new_tokens"],
-            remaining_context,
-        )
-        if current_sampling_params["max_new_tokens"] <= 0:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        payload = {
-            "input_ids": current_token_ids,
-            "sampling_params": current_sampling_params,
-            "return_logprob": True,  # Request log probabilities for training
-        }
-
-        print(
-            f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
-        )
-
-        output = await post(url, payload)
-
-        last_finish_reason = output["meta_info"]["finish_reason"]["type"]
-
-        # Handle abort
-        if last_finish_reason == "abort":
-            sample.status = Sample.Status.ABORTED
-            break
-
-        if "output_token_logprobs" in output["meta_info"]:
-            raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            raw_response = state.tokenizer.decode(raw_response_token_ids)
-            cur_response = postprocess_responses(raw_response)
-            cur_response_token_ids, cur_log_probs = _trim_response_token_prefix(
-                state.tokenizer,
-                raw_response_token_ids,
-                raw_log_probs,
-                cur_response,
-                sandbox_session_id=sandbox_session_id,
-                turn=turn,
+    async def _run_turns():
+        nonlocal response, response_token_ids, loss_masks, tool_call_count, last_finish_reason
+        # In the mixed-loss path, when sample.prompt ends with an assistant
+        # turn, the seeded response IS the entire trainable signal for this
+        # sample (pure SFT). Skipping the rollout avoids asking SGLang to
+        # generate "another" assistant turn after a closed conversation.
+        if sft_skip_rollout:
+            print(
+                f"[opd-mix] sample ends with assistant; skipping rollout "
+                f"(SFT-only sample, response_tokens={len(response_token_ids)})",
+                flush=True,
             )
-            if sample.rollout_log_probs is None:
-                sample.rollout_log_probs = []
-            sample.rollout_log_probs += cur_log_probs
+            return
+        for turn in range(TOOL_CONFIGS["max_turns"]):
+            prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
+            current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-        else:
-            cur_response = output["text"]
-            cur_response = postprocess_responses(cur_response)
-            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            # Check if total length exceeds max context length
+            total_length = len(current_prompt_token_ids)
+            if total_length >= max_context_length:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            remaining_context = max_context_length - total_length
 
-        response += cur_response
-        response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
+            # Use token IDs instead of text
+            current_token_ids = current_prompt_token_ids
+            current_sampling_params = dict(sampling_params)
+            current_sampling_params["max_new_tokens"] = min(
+                current_sampling_params["max_new_tokens"],
+                remaining_context,
+            )
+            if current_sampling_params["max_new_tokens"] <= 0:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            payload = {
+                "input_ids": current_token_ids,
+                "sampling_params": current_sampling_params,
+                "return_logprob": True,  # Request log probabilities for training
+            }
 
-        assistant_message = _build_assistant_message(cur_response)
-        if assistant_message is not None:
-            interaction_messages.append(assistant_message)
-            recorded_messages.append(assistant_message)
-            sample.messages = list(recorded_messages)
+            print(
+                f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
+            )
 
-        # Check length limit
-        if last_finish_reason == "length":
-            sample.status = Sample.Status.TRUNCATED
-            break
+            output = await post(url, payload)
 
-        # Skip tool execution entirely when tools are disabled. This makes
-        # max_tool_calls=0 a true "no tools" mode (single-shot completion).
-        if TOOL_CONFIGS["max_tool_calls"] <= 0:
-            break
-        if TOOL_CONFIGS["max_turns"] == 1:
-            break
+            last_finish_reason = output["meta_info"]["finish_reason"]["type"]
 
-        next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
-        if done:
-            break
-        if _ends_with_im_end(cur_response):
-            next_obs = _strip_leading_im_end(next_obs)
+            # Handle abort
+            if last_finish_reason == "abort":
+                sample.status = Sample.Status.ABORTED
+                break
 
-        # Count tool calls (when we get interpreter output, it means a tool
-        # was called)
-        if "<tool_response>" in next_obs:
-            tool_call_count += 1
+            if "output_token_logprobs" in output["meta_info"]:
+                raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+                raw_response = state.tokenizer.decode(raw_response_token_ids)
+                cur_response = postprocess_responses(raw_response)
+                cur_response_token_ids, cur_log_probs = _trim_response_token_prefix(
+                    state.tokenizer,
+                    raw_response_token_ids,
+                    raw_log_probs,
+                    cur_response,
+                    sandbox_session_id=sandbox_session_id,
+                    turn=turn,
+                )
+                if sample.rollout_log_probs is None:
+                    sample.rollout_log_probs = []
+                sample.rollout_log_probs += cur_log_probs
 
-        assert next_obs != "", "Next observation should not be empty."
-        obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-        remaining_observation_tokens = max_context_length - (
-            len(current_prompt_token_ids) + len(cur_response_token_ids)
+            else:
+                cur_response = output["text"]
+                cur_response = postprocess_responses(cur_response)
+                cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+
+            response += cur_response
+            response_token_ids += cur_response_token_ids
+            loss_masks += [1] * len(cur_response_token_ids)
+
+            assistant_message = _build_assistant_message(cur_response)
+            if assistant_message is not None:
+                interaction_messages.append(assistant_message)
+                recorded_messages.append(assistant_message)
+                sample.messages = list(recorded_messages)
+
+            # Check length limit
+            if last_finish_reason == "length":
+                sample.status = Sample.Status.TRUNCATED
+                break
+
+            # Skip tool execution entirely when tools are disabled. This makes
+            # max_tool_calls=0 a true "no tools" mode (single-shot completion).
+            if TOOL_CONFIGS["max_tool_calls"] <= 0:
+                break
+            if TOOL_CONFIGS["max_turns"] == 1:
+                break
+
+            next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
+            if done:
+                break
+            if _ends_with_im_end(cur_response):
+                next_obs = _strip_leading_im_end(next_obs)
+
+            # Count tool calls (when we get interpreter output, it means a tool
+            # was called)
+            if "<tool_response>" in next_obs:
+                tool_call_count += 1
+
+            assert next_obs != "", "Next observation should not be empty."
+            obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+            remaining_observation_tokens = max_context_length - (
+                len(current_prompt_token_ids) + len(cur_response_token_ids)
+            )
+            if remaining_observation_tokens <= 0:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            if len(obs_tokens_ids) > remaining_observation_tokens:
+                obs_tokens_ids = obs_tokens_ids[-remaining_observation_tokens:]
+                next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
+                sample.status = Sample.Status.TRUNCATED
+            response += next_obs
+            response_token_ids += obs_tokens_ids
+            loss_masks += [0] * len(obs_tokens_ids)
+
+            if tool_message is not None:
+                interaction_messages.append(tool_message)
+                recorded_messages.append(tool_message)
+                sample.messages = list(recorded_messages)
+
+            # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
+            # Check if maximum tool call count reached
+            if sample.rollout_log_probs is not None:
+                sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
+
+                assert len(response_token_ids) == len(
+                    sample.rollout_log_probs
+                ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
+
+            if sample.status == Sample.Status.TRUNCATED:
+                break
+
+            if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
+                break
+
+    # Wall-clock cap on the entire multi-turn rollout for this sample.
+    # On timeout, keep whatever partial response was decoded and mark the
+    # sample TRUNCATED so the rest of the batch can proceed instead of
+    # hanging forever on a pathological sample / stuck tool subprocess.
+    try:
+        await asyncio.wait_for(_run_turns(), timeout=_SAMPLE_TIMEOUT)
+    except asyncio.TimeoutError:
+        print(
+            f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} "
+            f"sample TIMEOUT after {_SAMPLE_TIMEOUT:.0f}s "
+            f"(turns_done<= {TOOL_CONFIGS['max_turns']}, tool_calls={tool_call_count})",
+            flush=True,
         )
-        if remaining_observation_tokens <= 0:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        if len(obs_tokens_ids) > remaining_observation_tokens:
-            obs_tokens_ids = obs_tokens_ids[-remaining_observation_tokens:]
-            next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
-            sample.status = Sample.Status.TRUNCATED
-        response += next_obs
-        response_token_ids += obs_tokens_ids
-        loss_masks += [0] * len(obs_tokens_ids)
-
-        if tool_message is not None:
-            interaction_messages.append(tool_message)
-            recorded_messages.append(tool_message)
-            sample.messages = list(recorded_messages)
-
-        # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
-        # Check if maximum tool call count reached
-        if sample.rollout_log_probs is not None:
-            sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
-
-            assert len(response_token_ids) == len(
-                sample.rollout_log_probs
-            ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
-
-        if sample.status == Sample.Status.TRUNCATED:
-            break
-
-        if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
-            break
+        sample.status = Sample.Status.TRUNCATED
 
     # Set sample attributes
     (
@@ -784,6 +1080,28 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     if sample.metadata is None:
         sample.metadata = {}
     sample.metadata["round_number"] = tool_call_count
+
+    # OPD per-turn reverse-KL weight. Computed here (not at data-prep) so the
+    # alpha hyper-parameter can be tuned via env var without re-baking the
+    # dataset. Requires the dataset to provide "assistant_turn_index" (0-indexed)
+    # and "total_assistant_turns" in sample.metadata. If either is missing we
+    # fall back to weight = 1.0 (feature inactive for that sample).
+    _k_raw = sample.metadata.get("assistant_turn_index")
+    _K_raw = sample.metadata.get("total_assistant_turns")
+    if _k_raw is not None and _K_raw is not None:
+        try:
+            _k = int(_k_raw)
+            _K = int(_K_raw)
+            if _K >= 1 and 0 <= _k < _K:
+                sample.metadata["opd_rev_kl_weight"] = _compute_normalized_turn_weight(
+                    _k, _K, _OPD_REV_TURN_DECAY_ALPHA
+                )
+            else:
+                sample.metadata["opd_rev_kl_weight"] = 1.0
+        except (TypeError, ValueError):
+            sample.metadata["opd_rev_kl_weight"] = 1.0
+    else:
+        sample.metadata["opd_rev_kl_weight"] = 1.0
 
     # Set status
     if sample.status not in {Sample.Status.TRUNCATED, Sample.Status.ABORTED}:
