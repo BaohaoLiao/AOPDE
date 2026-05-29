@@ -50,6 +50,10 @@ _TEACHER_MAX_INFLIGHT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_INFLIGH
 _TEACHER_REQUEST_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_REQUEST_TIMEOUT", "600"))
 _TEACHER_TOTAL_BUDGET = int(os.environ.get("MULTITEACHER_OPD_TEACHER_TOTAL_BUDGET", "900"))
 _TEACHER_MAX_RETRIES = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_RETRIES", "2"))
+_LAST_TASK_REWARD_MEAN = {"retool": 0.0, "search-r1": 0.0}
+_LAST_TASK_TRAIN_REWARD_MEAN = {"retool": 0.0, "search-r1": 0.0}
+_LAST_TASK_SCORE_MEAN = {"retool": 0.0, "search-r1": 0.0}
+_LAST_RETOOL_TOOL_CALL_COUNT_MEAN = 0.0
 
 
 def _metadata(sample: Sample) -> dict[str, Any]:
@@ -197,7 +201,21 @@ async def _teacher_logprob(args, sample: Sample, task: str) -> dict[str, Any] | 
 
 async def _task_reward(args, sample: Sample, task: str) -> float:
     if task == "retool":
-        reward = await generate_with_retool.reward_func(args, sample)
+        solution_str = generate_with_retool._prompt_to_text(sample.prompt) + sample.response
+        ground_truth = sample.label if sample.label is not None else ""
+        reward = generate_with_retool.math_dapo_compute_score(
+            solution_str,
+            ground_truth,
+            strict_box_verify=True,
+        )
+        task_score = float(reward["score"])
+        num_turns = int(getattr(sample, "tool_call_count", 0) or 0)
+        shaped_reward = task_score
+        if shaped_reward < 0:
+            tool_call_reward = (num_turns - 2) / 2 * 0.1
+            shaped_reward = min(-0.6, shaped_reward + tool_call_reward)
+        sample._opd_task_score_unshaped = task_score  # type: ignore[attr-defined]
+        return float(shaped_reward)
     elif task == "search-r1":
         reward = await generate_with_search.reward_func(args, sample)
     else:
@@ -205,11 +223,17 @@ async def _task_reward(args, sample: Sample, task: str) -> float:
 
     if isinstance(reward, dict):
         if "score" in reward:
-            return float(reward["score"])
+            scalar_reward = float(reward["score"])
+            sample._opd_task_score_unshaped = scalar_reward  # type: ignore[attr-defined]
+            return scalar_reward
         if "reward" in reward:
-            return float(reward["reward"])
+            scalar_reward = float(reward["reward"])
+            sample._opd_task_score_unshaped = scalar_reward  # type: ignore[attr-defined]
+            return scalar_reward
         raise ValueError(f"Cannot extract scalar reward from dict keys: {sorted(reward.keys())}")
-    return float(reward)
+    scalar_reward = float(reward)
+    sample._opd_task_score_unshaped = scalar_reward  # type: ignore[attr-defined]
+    return scalar_reward
 
 
 async def _reward_one(args, sample: Sample) -> float:
@@ -276,10 +300,14 @@ def _normalize_rewards(args, rewards: list[float]) -> list[float]:
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
+    global _LAST_RETOOL_TOOL_CALL_COUNT_MEAN
+
     raw_rewards = []
     sample_tasks = []
     task_counts = {"retool": 0, "search-r1": 0}
     task_raw_rewards = {"retool": [], "search-r1": []}
+    task_scores = {"retool": [], "search-r1": []}
+    retool_tool_call_counts = []
     failed_teachers = {"retool": 0, "search-r1": 0}
     has_round_number = any(sample.metadata and "round_number" in sample.metadata for sample in samples)
 
@@ -299,6 +327,10 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
         raw_reward = float(getattr(sample, "_opd_task_score", 0.0) or 0.0)
         raw_rewards.append(raw_reward)
         task_raw_rewards[task].append(raw_reward)
+        task_score = float(getattr(sample, "_opd_task_score_unshaped", raw_reward) or 0.0)
+        task_scores[task].append(task_score)
+        if task == "retool":
+            retool_tool_call_counts.append(float(getattr(sample, "tool_call_count", 0) or 0))
 
     if any(failed_teachers.values()):
         print(
@@ -315,22 +347,48 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     def mean(values: list[float]) -> float:
         return sum(values) / len(values) if values else 0.0
 
+    def mean_or_previous(task: str, values: list[float], cache: dict[str, float]) -> float:
+        if values:
+            cache[task] = mean(values)
+        return cache[task]
+
+    retool_reward_mean = mean_or_previous("retool", task_raw_rewards["retool"], _LAST_TASK_REWARD_MEAN)
+    search_r1_reward_mean = mean_or_previous("search-r1", task_raw_rewards["search-r1"], _LAST_TASK_REWARD_MEAN)
+    retool_task_score_mean = mean_or_previous("retool", task_scores["retool"], _LAST_TASK_SCORE_MEAN)
+    search_r1_task_score_mean = mean_or_previous("search-r1", task_scores["search-r1"], _LAST_TASK_SCORE_MEAN)
+    if retool_tool_call_counts:
+        _LAST_RETOOL_TOOL_CALL_COUNT_MEAN = mean(retool_tool_call_counts)
+    retool_tool_call_count_mean = _LAST_RETOOL_TOOL_CALL_COUNT_MEAN
+    retool_train_reward_mean = mean_or_previous(
+        "retool", task_train_rewards["retool"], _LAST_TASK_TRAIN_REWARD_MEAN
+    )
+    search_r1_train_reward_mean = mean_or_previous(
+        "search-r1", task_train_rewards["search-r1"], _LAST_TASK_TRAIN_REWARD_MEAN
+    )
+
     log_metrics = {
-        "rollout/student_task_score": mean(raw_rewards),
+        "rollout/student_task_score": mean(task_scores["retool"] + task_scores["search-r1"]),
+        "rollout/shaped_reward_mean": mean(raw_rewards),
         "rollout/retool_count": task_counts["retool"],
         "rollout/search_r1_count": task_counts["search-r1"],
         "rollout/retool_sample_count": task_counts["retool"],
         "rollout/search_r1_sample_count": task_counts["search-r1"],
-        "rollout/retool_reward_mean": mean(task_raw_rewards["retool"]),
-        "rollout/search_r1_reward_mean": mean(task_raw_rewards["search-r1"]),
-        "rollout/retool_train_reward_mean": mean(task_train_rewards["retool"]),
-        "rollout/search_r1_train_reward_mean": mean(task_train_rewards["search-r1"]),
+        "rollout/retool_reward_mean": retool_reward_mean,
+        "rollout/search_r1_reward_mean": search_r1_reward_mean,
+        "rollout/retool_shaped_reward_mean": retool_reward_mean,
+        "rollout/retool_task_score_mean": retool_task_score_mean,
+        "rollout/search_r1_task_score_mean": search_r1_task_score_mean,
+        "rollout/retool_tool_call_count_mean": retool_tool_call_count_mean,
+        "rollout/retool_train_reward_mean": retool_train_reward_mean,
+        "rollout/search_r1_train_reward_mean": search_r1_train_reward_mean,
     }
     print(
         "[multiteacher-opd] "
         f"retool_samples={task_counts['retool']} "
         f"search_r1_samples={task_counts['search-r1']} "
         f"retool_reward_mean={log_metrics['rollout/retool_reward_mean']:.4f} "
+        f"retool_task_score_mean={log_metrics['rollout/retool_task_score_mean']:.4f} "
+        f"retool_tool_calls_mean={log_metrics['rollout/retool_tool_call_count_mean']:.2f} "
         f"search_r1_reward_mean={log_metrics['rollout/search_r1_reward_mean']:.4f} "
         f"retool_train_reward_mean={log_metrics['rollout/retool_train_reward_mean']:.4f} "
         f"search_r1_train_reward_mean={log_metrics['rollout/search_r1_train_reward_mean']:.4f}",

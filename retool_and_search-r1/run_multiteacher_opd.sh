@@ -23,7 +23,31 @@ source "${MODEL_CONFIG}"
 HF_CHECKPOINT=${HF_CHECKPOINT:-/root/Qwen3-4B}
 REF_LOAD=${REF_LOAD:-/root/Qwen3-4B_torch_dist}
 SAVE_DIR=${SAVE_DIR:-/root/Qwen3-4B_retool_search_opd}
-PROMPT_DATA=${PROMPT_DATA:-/root/data/retool_search_mixed.jsonl}
+PROMPT_DATA=${PROMPT_DATA:-}
+
+# Data input modes:
+# 1. Pre-combined file: set PROMPT_DATA. Each row must carry metadata.task.
+# 2. Automatic mixed batches: set RETOOL_PROMPT_DATA and SEARCH_R1_PROMPT_DATA.
+#    MIXED_TASK_ORDER controls the within-batch ratio; repeating a task changes
+#    the ratio, e.g. retool,search-r1,search-r1 gives roughly 1:2.
+RETOOL_PROMPT_DATA=${RETOOL_PROMPT_DATA:-}
+SEARCH_R1_PROMPT_DATA=${SEARCH_R1_PROMPT_DATA:-}
+RETOOL_INPUT_KEY=${RETOOL_INPUT_KEY:-prompt}
+RETOOL_LABEL_KEY=${RETOOL_LABEL_KEY:-label}
+RETOOL_METADATA_KEY=${RETOOL_METADATA_KEY:-metadata}
+SEARCH_R1_INPUT_KEY=${SEARCH_R1_INPUT_KEY:-prompt}
+SEARCH_R1_LABEL_KEY=${SEARCH_R1_LABEL_KEY:-reward_model}
+SEARCH_R1_METADATA_KEY=${SEARCH_R1_METADATA_KEY:-metadata}
+MIXED_TASK_ORDER=${MIXED_TASK_ORDER:-retool,search-r1}
+
+if [[ -n "${RETOOL_PROMPT_DATA}" || -n "${SEARCH_R1_PROMPT_DATA}" ]]; then
+   : "${RETOOL_PROMPT_DATA:?Set RETOOL_PROMPT_DATA or use PROMPT_DATA for a pre-combined file.}"
+   : "${SEARCH_R1_PROMPT_DATA:?Set SEARCH_R1_PROMPT_DATA or use PROMPT_DATA for a pre-combined file.}"
+   DATA_SOURCE_ARGS=(--data-source-path mixed_data_source.MixedTaskDataSource)
+else
+   PROMPT_DATA=${PROMPT_DATA:-/root/data/retool_search_mixed.jsonl}
+   DATA_SOURCE_ARGS=(--prompt-data "${PROMPT_DATA}")
+fi
 
 ACTOR_NUM_GPUS_PER_NODE=${ACTOR_NUM_GPUS_PER_NODE:-4}
 ROLLOUT_NUM_GPUS=${ROLLOUT_NUM_GPUS:-4}
@@ -43,7 +67,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data "${PROMPT_DATA}"
+   "${DATA_SOURCE_ARGS[@]}"
    --input-key prompt
    --label-key label
    --metadata-key metadata
@@ -134,6 +158,15 @@ RUNTIME_ENV_JSON="{
     \"SEARCH_R1_TEACHER_MODEL_NAME\": \"${SEARCH_R1_TEACHER_MODEL_NAME:-search_r1_teacher}\",
     \"MULTITEACHER_OPD_TEACHER_URLS\": \"${MULTITEACHER_OPD_TEACHER_URLS:-}\",
     \"MULTITEACHER_OPD_USE_TASK_REWARD\": \"${MULTITEACHER_OPD_USE_TASK_REWARD:-1}\",
+    \"RETOOL_PROMPT_DATA\": \"${RETOOL_PROMPT_DATA}\",
+    \"RETOOL_INPUT_KEY\": \"${RETOOL_INPUT_KEY}\",
+    \"RETOOL_LABEL_KEY\": \"${RETOOL_LABEL_KEY}\",
+    \"RETOOL_METADATA_KEY\": \"${RETOOL_METADATA_KEY}\",
+    \"SEARCH_R1_PROMPT_DATA\": \"${SEARCH_R1_PROMPT_DATA}\",
+    \"SEARCH_R1_INPUT_KEY\": \"${SEARCH_R1_INPUT_KEY}\",
+    \"SEARCH_R1_LABEL_KEY\": \"${SEARCH_R1_LABEL_KEY}\",
+    \"SEARCH_R1_METADATA_KEY\": \"${SEARCH_R1_METADATA_KEY}\",
+    \"MIXED_TASK_ORDER\": \"${MIXED_TASK_ORDER}\",
     \"SEARCH_URL\": \"${SEARCH_URL:-}\",
     \"SEARCH_R1_MAX_TURNS\": \"${SEARCH_R1_MAX_TURNS:-4}\"
   }

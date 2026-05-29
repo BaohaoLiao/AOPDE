@@ -1,5 +1,12 @@
 # Adapted from https://github.com/volcengine/verl/blob/cb809d66e46dfd3342d008628891a14a054fa424/recipe/retool/retool.py
+import asyncio
+# IMPORTANT: install the stdlib asyncio loop policy BEFORE slime's
+# AsyncLoopThread creates its event loop. uvloop + concurrent subprocess.Popen
+# in tool_sandbox + many aiohttp sockets reliably triggers a SIGABRT in the
+# event-loop thread under load. The stdlib selector loop is slower but stable.
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 import json
+import os
 import re
 from typing import Any
 
@@ -14,7 +21,13 @@ except ImportError as e:
     raise ImportError("MathDapo is not installed") from e
 
 # Import tool sandbox functionality
-from tool_sandbox import SEMAPHORE, TOOL_CONFIGS, ToolRegistry
+from tool_sandbox import TOOL_CONFIGS, ToolRegistry
+
+# Wall-clock cap for the full multi-turn rollout of a single sample. When
+# exceeded, the partial response is kept (so far decoded tokens) and the
+# sample is marked TRUNCATED so the rest of the batch can proceed. Override
+# via the GENERATE_SAMPLE_TIMEOUT env var (seconds).
+_SAMPLE_TIMEOUT = float(os.environ.get("GENERATE_SAMPLE_TIMEOUT", "600"))
 
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant that can use Python "
@@ -362,9 +375,8 @@ def _prompt_to_text(prompt: str | list[dict[str, Any]]) -> str:
 def _find_boxed_spans(text: str) -> list[tuple[int, int, str]]:
     """Find all top-level ``\\boxed{...}`` spans with balanced braces.
 
-    Returns a list of ``(start, end, inner_content)`` tuples. Handles arbitrary
-    brace nesting (e.g. ``\\frac{a^{b}}{c}`` inside the box) which a fixed-depth
-    regex cannot match.
+    Handles arbitrary brace nesting (e.g. ``\\frac{a^{b}}{c}``) which a
+    fixed-depth regex cannot match.
     """
     spans: list[tuple[int, int, str]] = []
     needle = "\\boxed{"
@@ -411,9 +423,19 @@ def postprocess_predictions(prediction: str):
         tool_name = tool_call_data.get("name")
         arguments = tool_call_data.get("arguments", {})
 
+        # Some models emit arguments as a JSON-encoded string (OpenAI-style)
+        # rather than a dict. Decode defensively before .get().
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+
         if tool_name == "code_interpreter":
             code = arguments.get("code", "")
-            if code.strip():
+            if isinstance(code, str) and code.strip():
                 return "code", code
 
     # Then check for <code> tags
@@ -435,28 +457,17 @@ def postprocess_predictions(prediction: str):
 
 def postprocess_responses(resp: str) -> str:
     """Post-process response to ensure tag completeness"""
-
-    def keep_trailing_im_end(end: int) -> str:
-        marker = "<|im_end|>"
-        cursor = end
-        while cursor < len(resp) and resp[cursor].isspace():
-            cursor += 1
-        if resp.startswith(marker, cursor):
-            return resp[: cursor + len(marker)]
-        return resp[:end]
-
     # Handle <tool_call> tags (new format from Jinja2 template)
     if "<tool_call>" in resp:
         # Keep only the first complete <tool_call>...</tool_call> block.
         tool_call_pattern = r"<tool_call>\s*.*?\s*</tool_call>"
         match = re.search(tool_call_pattern, resp, re.DOTALL)
         if match:
-            return keep_trailing_im_end(match.end())
+            return resp[: match.end()]
 
     # Handle <code> tags
     if "</code>" in resp:
-        end = resp.find("</code>") + len("</code>")
-        return keep_trailing_im_end(end)
+        return resp.split("</code>")[0] + "</code>"
 
     # Handle ```python code blocks
     if "```python" in resp:
@@ -465,27 +476,15 @@ def postprocess_responses(resp: str) -> str:
         matches = list(re.finditer(python_pattern, resp, re.DOTALL))
         if matches:
             last_match = matches[-1]
-            return keep_trailing_im_end(last_match.end())
+            return resp[: last_match.end()]
 
     # Stop once any boxed final answer appears in the assistant response.
     if "\\boxed{" in resp:
         boxed_spans = _find_boxed_spans(resp)
         if boxed_spans:
-            return keep_trailing_im_end(boxed_spans[-1][1])
+            return resp[: boxed_spans[-1][1]]
 
     return resp
-
-
-def _ends_with_im_end(text: str) -> bool:
-    return text.rstrip().endswith("<|im_end|>")
-
-
-def _strip_leading_im_end(text: str) -> str:
-    marker = "<|im_end|>"
-    if not text.startswith(marker):
-        return text
-    text = text[len(marker):]
-    return text[1:] if text.startswith("\n") else text
 
 
 async def execute_predictions(
@@ -499,8 +498,7 @@ async def execute_predictions(
         # postprocess_predictions)
         code = content.strip()
         if code:
-            async with SEMAPHORE:
-                result = await tool_registry.execute_tool("code_interpreter", {"code": code})
+            result = await tool_registry.execute_tool("code_interpreter", {"code": code})
             tool_message = {"role": "tool", "content": str(result)}
             next_obs = _render_tool_message(tool_message)
             done = False
@@ -530,7 +528,6 @@ async def execute_predictions(
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Custom generation function supporting tool calls"""
     assert not args.partial_rollout, "Partial rollout is not supported for " "this function at the moment."
-
     state = GenerateState(args)
     tool_registry = ToolRegistry()
     sandbox_session_id = tool_registry.session_id
@@ -539,14 +536,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
     # Set up the initial prompt with system prompt and tools (outside the loop)
     tool_specs = tool_registry.get_tool_specs()
-    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
-    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
-    # Build recorded_messages with the full system prompt (including tool descriptions)
-    # so that payload_text faithfully reflects what the model actually sees.
+
+    # Build the full system prompt text once for recorded_messages.
     full_system_prompt = DEFAULT_SYSTEM_PROMPT
     if tool_specs:
         tool_lines = "\n".join(json.dumps(tool, ensure_ascii=False) for tool in tool_specs)
         full_system_prompt = f"{DEFAULT_SYSTEM_PROMPT}\n\n{TOOL_SYSTEM_PROMPT.replace('__TOOLS__', tool_lines)}"
+
+    prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs)
+    prompt_tokens_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    # Build recorded_messages with the full system prompt (including tool descriptions)
+    # so that payload_text faithfully reflects what the model actually sees.
     recorded_messages = _build_initial_recorded_messages(sample.prompt, system_prompt=full_system_prompt)
     interaction_messages: list[dict[str, Any]] = []
     if args.rollout_max_context_len is not None:
@@ -573,136 +573,151 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     tool_call_count = 0  # Track actual tool call rounds
     last_finish_reason = None
 
-    for turn in range(TOOL_CONFIGS["max_turns"]):
-        prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
-        current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
+    async def _run_turns():
+        nonlocal response, response_token_ids, loss_masks, tool_call_count, last_finish_reason
+        for turn in range(TOOL_CONFIGS["max_turns"]):
+            prompt = format_conversation_with_tools(prompt=sample.prompt, tools=tool_specs, messages=interaction_messages)
+            current_prompt_token_ids = state.tokenizer(prompt, add_special_tokens=False)["input_ids"]
 
-        # Check if total length exceeds max context length
-        total_length = len(current_prompt_token_ids)
-        if total_length >= max_context_length:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        remaining_context = max_context_length - total_length
+            # Check if total length exceeds max context length
+            total_length = len(current_prompt_token_ids)
+            if total_length >= max_context_length:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            remaining_context = max_context_length - total_length
 
-        # Use token IDs instead of text
-        current_token_ids = current_prompt_token_ids
-        current_sampling_params = dict(sampling_params)
-        current_sampling_params["max_new_tokens"] = min(
-            current_sampling_params["max_new_tokens"],
-            remaining_context,
-        )
-        if current_sampling_params["max_new_tokens"] <= 0:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        payload = {
-            "input_ids": current_token_ids,
-            "sampling_params": current_sampling_params,
-            "return_logprob": True,  # Request log probabilities for training
-        }
-
-        print(
-            f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
-        )
-
-        output = await post(url, payload)
-
-        last_finish_reason = output["meta_info"]["finish_reason"]["type"]
-
-        # Handle abort
-        if last_finish_reason == "abort":
-            sample.status = Sample.Status.ABORTED
-            break
-
-        if "output_token_logprobs" in output["meta_info"]:
-            raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-            raw_response = state.tokenizer.decode(raw_response_token_ids)
-            cur_response = postprocess_responses(raw_response)
-            cur_response_token_ids, cur_log_probs = _trim_response_token_prefix(
-                state.tokenizer,
-                raw_response_token_ids,
-                raw_log_probs,
-                cur_response,
-                sandbox_session_id=sandbox_session_id,
-                turn=turn,
+            # Use token IDs instead of text
+            current_token_ids = current_prompt_token_ids
+            current_sampling_params = dict(sampling_params)
+            current_sampling_params["max_new_tokens"] = min(
+                current_sampling_params["max_new_tokens"],
+                remaining_context,
             )
-            if sample.rollout_log_probs is None:
-                sample.rollout_log_probs = []
-            sample.rollout_log_probs += cur_log_probs
+            if current_sampling_params["max_new_tokens"] <= 0:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            payload = {
+                "input_ids": current_token_ids,
+                "sampling_params": current_sampling_params,
+                "return_logprob": True,  # Request log probabilities for training
+            }
 
-        else:
-            cur_response = output["text"]
-            cur_response = postprocess_responses(cur_response)
-            cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
+            print(
+                f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} turn={turn} tool_calls={tool_call_count}"
+            )
 
-        response += cur_response
-        response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
+            output = await post(url, payload)
 
-        assistant_message = _build_assistant_message(cur_response)
-        if assistant_message is not None:
-            interaction_messages.append(assistant_message)
-            recorded_messages.append(assistant_message)
-            sample.messages = list(recorded_messages)
+            last_finish_reason = output["meta_info"]["finish_reason"]["type"]
 
-        # Check length limit
-        if last_finish_reason == "length":
-            sample.status = Sample.Status.TRUNCATED
-            break
+            # Handle abort
+            if last_finish_reason == "abort":
+                sample.status = Sample.Status.ABORTED
+                break
 
-        # Skip tool execution entirely when tools are disabled. This makes
-        # max_tool_calls=0 a true "no tools" mode (single-shot completion).
-        if TOOL_CONFIGS["max_tool_calls"] <= 0:
-            break
-        if TOOL_CONFIGS["max_turns"] == 1:
-            break
+            if "output_token_logprobs" in output["meta_info"]:
+                raw_response_token_ids = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+                raw_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+                raw_response = state.tokenizer.decode(raw_response_token_ids)
+                cur_response = postprocess_responses(raw_response)
+                cur_response_token_ids, cur_log_probs = _trim_response_token_prefix(
+                    state.tokenizer,
+                    raw_response_token_ids,
+                    raw_log_probs,
+                    cur_response,
+                    sandbox_session_id=sandbox_session_id,
+                    turn=turn,
+                )
+                if sample.rollout_log_probs is None:
+                    sample.rollout_log_probs = []
+                sample.rollout_log_probs += cur_log_probs
 
-        next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
-        if done:
-            break
-        if _ends_with_im_end(cur_response):
-            next_obs = _strip_leading_im_end(next_obs)
+            else:
+                cur_response = output["text"]
+                cur_response = postprocess_responses(cur_response)
+                cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
 
-        # Count tool calls (when we get interpreter output, it means a tool
-        # was called)
-        if "<tool_response>" in next_obs:
-            tool_call_count += 1
+            response += cur_response
+            response_token_ids += cur_response_token_ids
+            loss_masks += [1] * len(cur_response_token_ids)
 
-        assert next_obs != "", "Next observation should not be empty."
-        obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
-        remaining_observation_tokens = max_context_length - (
-            len(current_prompt_token_ids) + len(cur_response_token_ids)
+            assistant_message = _build_assistant_message(cur_response)
+            if assistant_message is not None:
+                interaction_messages.append(assistant_message)
+                recorded_messages.append(assistant_message)
+                sample.messages = list(recorded_messages)
+
+            # Check length limit
+            if last_finish_reason == "length":
+                sample.status = Sample.Status.TRUNCATED
+                break
+
+            # Skip tool execution entirely when tools are disabled. This makes
+            # max_tool_calls=0 a true "no tools" mode (single-shot completion).
+            if TOOL_CONFIGS["max_tool_calls"] <= 0:
+                break
+            if TOOL_CONFIGS["max_turns"] == 1:
+                break
+
+            next_obs, done, tool_message = await execute_predictions(cur_response, tool_registry)
+            if done:
+                break
+
+            # Count tool calls (when we get interpreter output, it means a tool
+            # was called)
+            if "<tool_response>" in next_obs:
+                tool_call_count += 1
+
+            assert next_obs != "", "Next observation should not be empty."
+            obs_tokens_ids = state.tokenizer(next_obs, add_special_tokens=False)["input_ids"]
+            remaining_observation_tokens = max_context_length - (
+                len(current_prompt_token_ids) + len(cur_response_token_ids)
+            )
+            if remaining_observation_tokens <= 0:
+                sample.status = Sample.Status.TRUNCATED
+                break
+            if len(obs_tokens_ids) > remaining_observation_tokens:
+                obs_tokens_ids = obs_tokens_ids[-remaining_observation_tokens:]
+                next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
+                sample.status = Sample.Status.TRUNCATED
+            response += next_obs
+            response_token_ids += obs_tokens_ids
+            loss_masks += [0] * len(obs_tokens_ids)
+
+            if tool_message is not None:
+                interaction_messages.append(tool_message)
+                recorded_messages.append(tool_message)
+                sample.messages = list(recorded_messages)
+
+            # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
+            # Check if maximum tool call count reached
+            if sample.rollout_log_probs is not None:
+                sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
+
+                assert len(response_token_ids) == len(
+                    sample.rollout_log_probs
+                ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
+
+            if sample.status == Sample.Status.TRUNCATED:
+                break
+
+            if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
+                break
+
+    # Wall-clock cap on the entire multi-turn rollout for this sample.
+    # On timeout, keep whatever partial response was decoded and mark the
+    # sample TRUNCATED so the rest of the batch can proceed instead of
+    # hanging forever on a pathological sample / stuck tool subprocess.
+    try:
+        await asyncio.wait_for(_run_turns(), timeout=_SAMPLE_TIMEOUT)
+    except asyncio.TimeoutError:
+        print(
+            f"[sandbox] session={sandbox_session_id} backend={sandbox_backend} "
+            f"sample TIMEOUT after {_SAMPLE_TIMEOUT:.0f}s "
+            f"(turns_done<= {TOOL_CONFIGS['max_turns']}, tool_calls={tool_call_count})",
+            flush=True,
         )
-        if remaining_observation_tokens <= 0:
-            sample.status = Sample.Status.TRUNCATED
-            break
-        if len(obs_tokens_ids) > remaining_observation_tokens:
-            obs_tokens_ids = obs_tokens_ids[-remaining_observation_tokens:]
-            next_obs = state.tokenizer.decode(obs_tokens_ids, skip_special_tokens=False)
-            sample.status = Sample.Status.TRUNCATED
-        response += next_obs
-        response_token_ids += obs_tokens_ids
-        loss_masks += [0] * len(obs_tokens_ids)
-
-        if tool_message is not None:
-            interaction_messages.append(tool_message)
-            recorded_messages.append(tool_message)
-            sample.messages = list(recorded_messages)
-
-        # Add dummy log probs for observation tokens (they won't be used due to loss_mask=0)
-        # Check if maximum tool call count reached
-        if sample.rollout_log_probs is not None:
-            sample.rollout_log_probs += [0.0] * len(obs_tokens_ids)
-
-            assert len(response_token_ids) == len(
-                sample.rollout_log_probs
-            ), f"Token/logp length mismatch at turn {turn}: {len(response_token_ids)} tokens vs {len(sample.rollout_log_probs)} logps"
-
-        if sample.status == Sample.Status.TRUNCATED:
-            break
-
-        if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
-            break
+        sample.status = Sample.Status.TRUNCATED
 
     # Set sample attributes
     (
@@ -784,6 +799,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     if sample.metadata is None:
         sample.metadata = {}
     sample.metadata["round_number"] = tool_call_count
+
+    sample.metadata["opd_rev_kl_weight"] = 1.0
 
     # Set status
     if sample.status not in {Sample.Status.TRUNCATED, Sample.Status.ABORTED}:
