@@ -48,6 +48,8 @@ _session_by_loop: dict[int, aiohttp.ClientSession] = {}
 _semaphore_by_loop: dict[int, asyncio.Semaphore] = {}
 _TEACHER_MAX_INFLIGHT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_INFLIGHT", "64"))
 _TEACHER_REQUEST_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_REQUEST_TIMEOUT", "600"))
+_TEACHER_CONNECT_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_CONNECT_TIMEOUT", "60"))
+_TEACHER_SOCK_READ_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_SOCK_READ_TIMEOUT", "300"))
 _TEACHER_TOTAL_BUDGET = int(os.environ.get("MULTITEACHER_OPD_TEACHER_TOTAL_BUDGET", "900"))
 _TEACHER_MAX_RETRIES = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_RETRIES", "2"))
 _LAST_TASK_REWARD_MEAN = {"retool": 0.0, "search-r1": 0.0}
@@ -123,9 +125,9 @@ async def _get_session() -> aiohttp.ClientSession:
 
         timeout = aiohttp.ClientTimeout(
             total=_TEACHER_REQUEST_TIMEOUT,
-            connect=60,
-            sock_connect=60,
-            sock_read=300,
+            connect=_TEACHER_CONNECT_TIMEOUT,
+            sock_connect=_TEACHER_CONNECT_TIMEOUT,
+            sock_read=_TEACHER_SOCK_READ_TIMEOUT,
         )
         connector = aiohttp.TCPConnector(
             limit=128,
@@ -241,10 +243,10 @@ async def _reward_one(args, sample: Sample) -> float:
         raise TypeError("Sample must be an instance of Sample class.")
 
     task = _get_task(sample)
-    task_reward, teacher_response = await asyncio.gather(
-        _task_reward(args, sample, task),
-        _teacher_logprob(args, sample, task),
-    )
+    # Keep teacher scoring and task scoring in one coroutine. This mirrors the
+    # Retool-only OPD path more closely than spawning a per-sample gather.
+    teacher_response = await _teacher_logprob(args, sample, task)
+    task_reward = await _task_reward(args, sample, task)
 
     sample._opd_task = task  # type: ignore[attr-defined]
     sample._opd_task_score = task_reward  # type: ignore[attr-defined]
