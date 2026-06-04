@@ -76,6 +76,17 @@ launch_teacher() {
    local extra_args="${11:-}"
    local log_path="${SAVE_DIR}/sglang_${name}_teacher_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
+   # Only cap the KV-cache token budget when explicitly requested. Leaving
+   # --max-total-tokens unset lets SGLang auto-size from --mem-fraction-static
+   # (this matches retool/retool_opd_4b24b.sh). A small cap (e.g. 20000) starves
+   # the teacher's KV cache: each teacher logprob request prefills the FULL
+   # prompt+response (up to ~10k tokens) so only ~2 sequences fit at once,
+   # which makes the 64 in-flight requests queue and time out -> retries.
+   local max_total_tokens_arg=""
+   if [ -n "${max_total_tokens}" ]; then
+      max_total_tokens_arg="--max-total-tokens '${max_total_tokens}'"
+   fi
+
    CUDA_VISIBLE_DEVICES=${gpus} \
       bash -c "cd /tmp && exec python3 -m sglang.launch_server \
       --model-path '${model_path}' \
@@ -86,7 +97,7 @@ launch_teacher() {
       --chunked-prefill-size '${TEACHER_CHUNKED_PREFILL_SIZE:-2048}' \
       --mem-fraction-static '${mem_fraction}' \
       --max-running-requests '${max_running_requests}' \
-      --max-total-tokens '${max_total_tokens}' \
+      ${max_total_tokens_arg} \
       --schedule-conservativeness '${schedule_conservativeness}' \
       --disable-radix-cache \
       ${extra_args}" \
@@ -139,7 +150,7 @@ if [ "${START_RETOOL_TEACHER}" = "1" ]; then
          "${RETOOL_TEACHER_MEM_FRACTION_STATIC:-0.85}" \
          "${RETOOL_TEACHER_MAX_RUNNING_REQUESTS:-128}" \
          "${RETOOL_TEACHER_SCHEDULE_CONSERVATIVENESS:-0.3}" \
-         "${RETOOL_TEACHER_MAX_TOTAL_TOKENS:-20000}" \
+         "${RETOOL_TEACHER_MAX_TOTAL_TOKENS:-}" \
          "${RETOOL_TEACHER_EXTRA_ARGS:-}"
    )
    RETOOL_TEACHER_PID="${RETOOL_LAUNCH_INFO%%:*}"
