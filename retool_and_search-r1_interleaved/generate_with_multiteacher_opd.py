@@ -45,8 +45,22 @@ DEFAULT_TEACHER_MODEL = {
 
 _session_lock = asyncio.Lock()
 _session_by_loop: dict[int, aiohttp.ClientSession] = {}
-_semaphore_by_loop: dict[int, asyncio.Semaphore] = {}
+# Per-(loop, task) in-flight semaphore. The two teachers have very different
+# capacities (e.g. retool on 3-4 GPUs, search-r1 on 1 GPU). A single shared
+# semaphore lets the slow single-GPU teacher hold slots that the retool teacher
+# needs, and lets up to MAX_INFLIGHT heavy retool prefills hit a 3-GPU teacher
+# at once -> KV overrun -> server queueing -> sock_read timeout -> retries.
+# Bounding each teacher independently keeps each server's queue shallow.
+_semaphore_by_loop: dict[tuple[int, str], asyncio.Semaphore] = {}
 _TEACHER_MAX_INFLIGHT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_MAX_INFLIGHT", "64"))
+_TEACHER_MAX_INFLIGHT_BY_TASK = {
+    "retool": int(
+        os.environ.get("MULTITEACHER_OPD_RETOOL_MAX_INFLIGHT", str(_TEACHER_MAX_INFLIGHT))
+    ),
+    "search-r1": int(
+        os.environ.get("MULTITEACHER_OPD_SEARCH_R1_MAX_INFLIGHT", str(_TEACHER_MAX_INFLIGHT))
+    ),
+}
 _TEACHER_REQUEST_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_REQUEST_TIMEOUT", "600"))
 _TEACHER_CONNECT_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_CONNECT_TIMEOUT", "60"))
 _TEACHER_SOCK_READ_TIMEOUT = int(os.environ.get("MULTITEACHER_OPD_TEACHER_SOCK_READ_TIMEOUT", "300"))
@@ -101,12 +115,13 @@ def _get_teacher_url(args, task: str) -> str:
     )
 
 
-def _get_semaphore() -> asyncio.Semaphore:
+def _get_semaphore(task: str) -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
-    key = id(loop)
+    key = (id(loop), task)
     sem = _semaphore_by_loop.get(key)
     if sem is None:
-        sem = asyncio.Semaphore(_TEACHER_MAX_INFLIGHT)
+        limit = _TEACHER_MAX_INFLIGHT_BY_TASK.get(task, _TEACHER_MAX_INFLIGHT)
+        sem = asyncio.Semaphore(limit)
         _semaphore_by_loop[key] = sem
     return sem
 
@@ -168,7 +183,7 @@ async def _teacher_logprob(args, sample: Sample, task: str) -> dict[str, Any] | 
         ]
 
     last_err: Exception | None = None
-    sem = _get_semaphore()
+    sem = _get_semaphore(task)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _TEACHER_TOTAL_BUDGET
     url = _get_teacher_url(args, task)
